@@ -182,8 +182,8 @@ def _format_doc_symbols(symbols: list[dict], indent: int = 0) -> list[str]:
 # MCP tools
 # ---------------------------------------------------------------------------
 
-_INDEXING_MSG = (
-    "clangd is still indexing the project. Please retry in a moment."
+_INDEXING_WARNING = (
+    "Warning: clangd is still indexing the project. Results may be incomplete.\n\n"
 )
 
 
@@ -200,11 +200,10 @@ async def find_symbol(query: str) -> str:
     Supports partial and fuzzy name matching.
     """
     assert lsp is not None
-    if _indexing():
-        return _INDEXING_MSG
+    warning = _INDEXING_WARNING if _indexing() else ""
     symbols = await lsp.workspace_symbol(query)
     if not symbols:
-        return f"No symbols found matching '{query}'."
+        return warning + f"No symbols found matching '{query}'."
 
     lines = [f"Found {len(symbols)} symbol(s) matching '{query}':\n"]
     for sym in symbols[:50]:
@@ -219,7 +218,7 @@ async def find_symbol(query: str) -> str:
     if len(symbols) > 50:
         lines.append(f"\n  … and {len(symbols) - 50} more (refine your query)")
 
-    return "\n".join(lines)
+    return warning + "\n".join(lines)
 
 
 @mcp.tool()
@@ -231,11 +230,10 @@ async def get_definition(symbol_name: str) -> str:
     snippet at the definition site.
     """
     assert lsp is not None
-    if _indexing():
-        return _INDEXING_MSG
+    warning = _INDEXING_WARNING if _indexing() else ""
     symbols = await lsp.workspace_symbol(symbol_name)
     if not symbols:
-        return f"No symbols found matching '{symbol_name}'."
+        return warning + f"No symbols found matching '{symbol_name}'."
 
     # Prefer an exact name match; otherwise use the first result.
     exact = [s for s in symbols if s.get("name") == symbol_name]
@@ -260,12 +258,12 @@ async def get_definition(symbol_name: str) -> str:
         def_line = def_start.get("line", 0)
         loc_str = _format_location(def_loc)
         snippet = _source_context(def_path, def_line)
-        return f"Definition of '{sym['name']}' at {loc_str}:\n\n{snippet}"
+        return warning + f"Definition of '{sym['name']}' at {loc_str}:\n\n{snippet}"
     else:
         # Fall back to the symbol's own declared location.
         loc_str = _format_location(decl_loc)
         snippet = _source_context(decl_path, decl_line)
-        return f"'{sym['name']}' at {loc_str}:\n\n{snippet}"
+        return warning + f"'{sym['name']}' at {loc_str}:\n\n{snippet}"
 
 
 @mcp.tool()
@@ -276,11 +274,10 @@ async def find_references(symbol_name: str) -> str:
     about (including the declaration).  Results are grouped by file.
     """
     assert lsp is not None
-    if _indexing():
-        return _INDEXING_MSG
+    warning = _INDEXING_WARNING if _indexing() else ""
     symbols = await lsp.workspace_symbol(symbol_name)
     if not symbols:
-        return f"No symbols found matching '{symbol_name}'."
+        return warning + f"No symbols found matching '{symbol_name}'."
 
     exact = [s for s in symbols if s.get("name") == symbol_name]
     sym = exact[0] if exact else symbols[0]
@@ -295,7 +292,7 @@ async def find_references(symbol_name: str) -> str:
 
     refs = await lsp.references(decl_path, decl_line, decl_char)
     if not refs:
-        return f"No references found for '{symbol_name}'."
+        return warning + f"No references found for '{symbol_name}'."
 
     # Group by file path, sorted by line within each file.
     by_file: dict[str, list[dict]] = {}
@@ -318,7 +315,7 @@ async def find_references(symbol_name: str) -> str:
             src = src_lines[line_0].strip() if line_0 < len(src_lines) else ""
             lines.append(f"  {line_0 + 1}:{col_0 + 1}  {src}")
 
-    return "\n".join(lines)
+    return warning + "\n".join(lines)
 
 
 @mcp.tool()
@@ -329,11 +326,10 @@ async def get_type_info(symbol_name: str) -> str:
     which typically includes the type signature and any documentation comments.
     """
     assert lsp is not None
-    if _indexing():
-        return _INDEXING_MSG
+    warning = _INDEXING_WARNING if _indexing() else ""
     symbols = await lsp.workspace_symbol(symbol_name)
     if not symbols:
-        return f"No symbols found matching '{symbol_name}'."
+        return warning + f"No symbols found matching '{symbol_name}'."
 
     exact = [s for s in symbols if s.get("name") == symbol_name]
     sym = exact[0] if exact else symbols[0]
@@ -348,11 +344,11 @@ async def get_type_info(symbol_name: str) -> str:
 
     hover = await lsp.hover(decl_path, decl_line, decl_char)
     if not hover:
-        return f"No type information available for '{sym['name']}'."
+        return warning + f"No type information available for '{sym['name']}'."
 
     contents = _format_hover_contents(hover.get("contents", ""))
     loc_str = _format_location(decl_loc)
-    return f"Type info for '{sym['name']}' at {loc_str}:\n\n{contents}"
+    return warning + f"Type info for '{sym['name']}' at {loc_str}:\n\n{contents}"
 
 
 @mcp.tool()
@@ -363,11 +359,10 @@ async def find_implementations(symbol_name: str) -> str:
     across the codebase. Useful for navigating polymorphic code.
     """
     assert lsp is not None
-    if _indexing():
-        return _INDEXING_MSG
+    warning = _INDEXING_WARNING if _indexing() else ""
     symbols = await lsp.workspace_symbol(symbol_name)
     if not symbols:
-        return f"No symbols found matching '{symbol_name}'."
+        return warning + f"No symbols found matching '{symbol_name}'."
 
     exact = [s for s in symbols if s.get("name") == symbol_name]
     sym = exact[0] if exact else symbols[0]
@@ -382,7 +377,7 @@ async def find_implementations(symbol_name: str) -> str:
 
     impls = await lsp.implementation(decl_path, decl_line, decl_char)
     if not impls:
-        return f"No implementations found for '{sym['name']}'."
+        return warning + f"No implementations found for '{sym['name']}'."
 
     by_file: dict[str, list[dict]] = {}
     for impl in impls:
@@ -404,7 +399,7 @@ async def find_implementations(symbol_name: str) -> str:
             src = src_lines[line_0].strip() if line_0 < len(src_lines) else ""
             lines.append(f"  {line_0 + 1}:{col_0 + 1}  {src}")
 
-    return "\n".join(lines)
+    return warning + "\n".join(lines)
 
 
 @mcp.tool()
@@ -415,11 +410,10 @@ async def get_callers(symbol_name: str) -> str:
     every location in the codebase that calls this function.
     """
     assert lsp is not None
-    if _indexing():
-        return _INDEXING_MSG
+    warning = _INDEXING_WARNING if _indexing() else ""
     symbols = await lsp.workspace_symbol(symbol_name)
     if not symbols:
-        return f"No symbols found matching '{symbol_name}'."
+        return warning + f"No symbols found matching '{symbol_name}'."
 
     exact = [s for s in symbols if s.get("name") == symbol_name]
     sym = exact[0] if exact else symbols[0]
@@ -434,12 +428,12 @@ async def get_callers(symbol_name: str) -> str:
 
     items = await lsp.prepare_call_hierarchy(decl_path, decl_line, decl_char)
     if not items:
-        return f"'{sym['name']}' is not callable or not found in the call hierarchy."
+        return warning + f"'{sym['name']}' is not callable or not found in the call hierarchy."
 
     root_item = items[0]
     calls = await lsp.incoming_calls(root_item)
     if not calls:
-        return f"No callers found for '{sym['name']}'."
+        return warning + f"No callers found for '{sym['name']}'."
 
     lines = [f"Found {len(calls)} caller(s) of '{sym['name']}':\n"]
     for call in calls:
@@ -459,7 +453,7 @@ async def get_callers(symbol_name: str) -> str:
             src = src_lines[line_0].strip() if line_0 < len(src_lines) else ""
             lines.append(f"    called at {line_0 + 1}:{col_0 + 1}  {src}")
 
-    return "\n".join(lines)
+    return warning + "\n".join(lines)
 
 
 @mcp.tool()
@@ -470,11 +464,10 @@ async def get_callees(symbol_name: str) -> str:
     every function that this function calls.
     """
     assert lsp is not None
-    if _indexing():
-        return _INDEXING_MSG
+    warning = _INDEXING_WARNING if _indexing() else ""
     symbols = await lsp.workspace_symbol(symbol_name)
     if not symbols:
-        return f"No symbols found matching '{symbol_name}'."
+        return warning + f"No symbols found matching '{symbol_name}'."
 
     exact = [s for s in symbols if s.get("name") == symbol_name]
     sym = exact[0] if exact else symbols[0]
@@ -489,12 +482,12 @@ async def get_callees(symbol_name: str) -> str:
 
     items = await lsp.prepare_call_hierarchy(decl_path, decl_line, decl_char)
     if not items:
-        return f"'{sym['name']}' is not callable or not found in the call hierarchy."
+        return warning + f"'{sym['name']}' is not callable or not found in the call hierarchy."
 
     root_item = items[0]
     calls = await lsp.outgoing_calls(root_item)
     if not calls:
-        return f"No callees found for '{sym['name']}'."
+        return warning + f"No callees found for '{sym['name']}'."
 
     try:
         src_lines = pathlib.Path(decl_path).read_text(errors="replace").splitlines()
@@ -514,7 +507,7 @@ async def get_callees(symbol_name: str) -> str:
             src = src_lines[line_0].strip() if line_0 < len(src_lines) else ""
             lines.append(f"    called at {line_0 + 1}:{col_0 + 1}  {src}")
 
-    return "\n".join(lines)
+    return warning + "\n".join(lines)
 
 
 @mcp.tool()
@@ -525,19 +518,18 @@ async def list_file_symbols(file_path: str) -> str:
     Returns a structured outline of all symbols with their kinds and locations.
     """
     assert lsp is not None
-    if _indexing():
-        return _INDEXING_MSG
+    warning = _INDEXING_WARNING if _indexing() else ""
 
     abs_path = os.path.abspath(file_path)
     await lsp.open_file(abs_path)
 
     symbols = await lsp.document_symbol(abs_path)
     if not symbols:
-        return f"No symbols found in '{abs_path}'."
+        return warning + f"No symbols found in '{abs_path}'."
 
     sym_lines = _format_doc_symbols(symbols)
     header = f"Symbols in '{abs_path}' ({len(sym_lines)} entries):\n"
-    return header + "\n".join(sym_lines)
+    return warning + header + "\n".join(sym_lines)
 
 
 @mcp.tool()
@@ -548,11 +540,10 @@ async def get_type_hierarchy(symbol_name: str) -> str:
     and derived classes (subtypes) from clangd.
     """
     assert lsp is not None
-    if _indexing():
-        return _INDEXING_MSG
+    warning = _INDEXING_WARNING if _indexing() else ""
     symbols = await lsp.workspace_symbol(symbol_name)
     if not symbols:
-        return f"No symbols found matching '{symbol_name}'."
+        return warning + f"No symbols found matching '{symbol_name}'."
 
     exact = [s for s in symbols if s.get("name") == symbol_name]
     sym = exact[0] if exact else symbols[0]
@@ -567,7 +558,7 @@ async def get_type_hierarchy(symbol_name: str) -> str:
 
     items = await lsp.prepare_type_hierarchy(decl_path, decl_line, decl_char)
     if not items:
-        return f"'{sym['name']}' is not a type or not found in the type hierarchy."
+        return warning + f"'{sym['name']}' is not a type or not found in the type hierarchy."
 
     root_item = items[0]
     supertypes, subtypes = await asyncio.gather(
@@ -591,7 +582,7 @@ async def get_type_hierarchy(symbol_name: str) -> str:
     else:
         lines.append("  (none)")
 
-    return "\n".join(lines)
+    return warning + "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
