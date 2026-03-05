@@ -257,3 +257,60 @@ class LSPClient:
             "context": {"includeDeclaration": True},
         })
         return result or []
+
+    async def hover(self, path: str, line: int, character: int) -> dict | None:
+        """textDocument/hover — get type/doc info at a position."""
+        result = await self.request("textDocument/hover", {
+            "textDocument": {"uri": path_to_uri(path)},
+            "position": {"line": line, "character": character},
+        })
+        return result
+
+    async def implementation(self, path: str, line: int, character: int) -> list[dict]:
+        """textDocument/implementation — find implementations of a virtual method or interface."""
+        result = await self.request("textDocument/implementation", {
+            "textDocument": {"uri": path_to_uri(path)},
+            "position": {"line": line, "character": character},
+        })
+        if not result:
+            return []
+        return result if isinstance(result, list) else [result]
+
+    async def document_symbol(self, path: str) -> list[dict]:
+        """textDocument/documentSymbol — list all symbols in a file."""
+        result = await self.request("textDocument/documentSymbol", {
+            "textDocument": {"uri": path_to_uri(path)},
+        })
+        return result or []
+
+    async def prepare_call_hierarchy(self, path: str, line: int, character: int) -> list[dict]:
+        """textDocument/prepareCallHierarchy — prepare a call hierarchy item at position."""
+        result = await self.request("textDocument/prepareCallHierarchy", {
+            "textDocument": {"uri": path_to_uri(path)},
+            "position": {"line": line, "character": character},
+        })
+        return result or []
+
+    async def incoming_calls(self, item: dict) -> list[dict]:
+        """callHierarchy/incomingCalls — find callers of a call hierarchy item."""
+        return (await self.request("callHierarchy/incomingCalls", {"item": item})) or []
+
+    async def outgoing_calls(self, item: dict) -> list[dict]:
+        """callHierarchy/outgoingCalls — find callees of a call hierarchy item."""
+        return (await self.request("callHierarchy/outgoingCalls", {"item": item})) or []
+
+    async def prepare_type_hierarchy(self, path: str, line: int, character: int) -> list[dict]:
+        """textDocument/prepareTypeHierarchy — prepare a type hierarchy item at position."""
+        result = await self.request("textDocument/prepareTypeHierarchy", {
+            "textDocument": {"uri": path_to_uri(path)},
+            "position": {"line": line, "character": character},
+        })
+        return result or []
+
+    async def type_supertypes(self, item: dict) -> list[dict]:
+        """typeHierarchy/supertypes — find supertypes of a type hierarchy item."""
+        return (await self.request("typeHierarchy/supertypes", {"item": item})) or []
+
+    async def type_subtypes(self, item: dict) -> list[dict]:
+        """typeHierarchy/subtypes — find subtypes of a type hierarchy item."""
+        return (await self.request("typeHierarchy/subtypes", {"item": item})) or []

@@ -267,6 +267,70 @@ class TestLSPFeatureMethods(unittest.IsolatedAsyncioTestCase):
         import os
         os.unlink(tmp_path)
 
+    async def test_hover_returns_result(self):
+        hover = {"contents": {"kind": "markdown", "value": "**int** foo"}}
+        client = self._client({"textDocument/hover": hover})
+        result = await client.hover("/a.cpp", 5, 3)
+        self.assertEqual(result, hover)
+
+    async def test_hover_returns_none(self):
+        client = self._client({"textDocument/hover": None})
+        result = await client.hover("/a.cpp", 0, 0)
+        self.assertIsNone(result)
+
+    async def test_document_symbol_returns_list(self):
+        syms = [{"name": "Foo", "kind": 5, "range": {"start": {"line": 0, "character": 0}, "end": {"line": 10, "character": 1}}, "selectionRange": {"start": {"line": 0, "character": 6}, "end": {"line": 0, "character": 9}}}]
+        client = self._client({"textDocument/documentSymbol": syms})
+        result = await client.document_symbol("/a.cpp")
+        self.assertEqual(result, syms)
+
+    async def test_document_symbol_empty(self):
+        client = self._client({"textDocument/documentSymbol": None})
+        result = await client.document_symbol("/a.cpp")
+        self.assertEqual(result, [])
+
+    async def test_implementation_wraps_single_result(self):
+        loc = {"uri": "file:///b.cpp", "range": {"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 5}}}
+        client = self._client({"textDocument/implementation": loc})
+        result = await client.implementation("/a.cpp", 0, 0)
+        self.assertEqual(result, [loc])
+
+    async def test_prepare_call_hierarchy_returns_list(self):
+        item = {"name": "myFunc", "kind": 12, "uri": "file:///a.cpp", "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 6}}, "selectionRange": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 6}}}
+        client = self._client({"textDocument/prepareCallHierarchy": [item]})
+        result = await client.prepare_call_hierarchy("/a.cpp", 0, 0)
+        self.assertEqual(result, [item])
+
+    async def test_incoming_calls_returns_list(self):
+        call = {"from": {"name": "caller", "kind": 12, "uri": "file:///b.cpp", "range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 6}}, "selectionRange": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 6}}}, "fromRanges": [{"start": {"line": 3, "character": 2}, "end": {"line": 3, "character": 8}}]}
+        client = self._client({"callHierarchy/incomingCalls": [call]})
+        result = await client.incoming_calls({"name": "myFunc"})
+        self.assertEqual(result, [call])
+
+    async def test_outgoing_calls_returns_list(self):
+        call = {"to": {"name": "helper", "kind": 12, "uri": "file:///c.cpp", "range": {"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 6}}, "selectionRange": {"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 6}}}, "fromRanges": [{"start": {"line": 10, "character": 4}, "end": {"line": 10, "character": 10}}]}
+        client = self._client({"callHierarchy/outgoingCalls": [call]})
+        result = await client.outgoing_calls({"name": "myFunc"})
+        self.assertEqual(result, [call])
+
+    async def test_prepare_type_hierarchy_returns_list(self):
+        item = {"name": "Base", "kind": 5, "uri": "file:///a.h", "range": {"start": {"line": 0, "character": 0}, "end": {"line": 10, "character": 1}}, "selectionRange": {"start": {"line": 0, "character": 6}, "end": {"line": 0, "character": 10}}}
+        client = self._client({"textDocument/prepareTypeHierarchy": [item]})
+        result = await client.prepare_type_hierarchy("/a.h", 0, 6)
+        self.assertEqual(result, [item])
+
+    async def test_type_supertypes_returns_list(self):
+        super_item = {"name": "Animal", "kind": 5, "uri": "file:///animal.h", "range": {"start": {"line": 0, "character": 0}, "end": {"line": 5, "character": 1}}, "selectionRange": {"start": {"line": 0, "character": 6}, "end": {"line": 0, "character": 12}}}
+        client = self._client({"typeHierarchy/supertypes": [super_item]})
+        result = await client.type_supertypes({"name": "Dog"})
+        self.assertEqual(result, [super_item])
+
+    async def test_type_subtypes_returns_list(self):
+        sub_item = {"name": "Poodle", "kind": 5, "uri": "file:///poodle.h", "range": {"start": {"line": 0, "character": 0}, "end": {"line": 5, "character": 1}}, "selectionRange": {"start": {"line": 0, "character": 6}, "end": {"line": 0, "character": 12}}}
+        client = self._client({"typeHierarchy/subtypes": [sub_item]})
+        result = await client.type_subtypes({"name": "Dog"})
+        self.assertEqual(result, [sub_item])
+
 
 # ---------------------------------------------------------------------------
 # Integration-style tests: MCP tool handlers
@@ -375,6 +439,221 @@ class TestMCPTools(unittest.IsolatedAsyncioTestCase):
         with patch.object(server, "lsp", self._mock_lsp(workspace_symbol=[])):
             result = await server.find_references("nobody")
         self.assertIn("No symbols found", result)
+
+    def _call_item(self, name, file="/proj/foo.cpp", line=0):
+        """Build a minimal CallHierarchyItem / TypeHierarchyItem dict."""
+        from lsp_client import path_to_uri
+        uri = path_to_uri(file)
+        rng = {"start": {"line": line, "character": 0}, "end": {"line": line, "character": len(name)}}
+        return {"name": name, "kind": 12, "uri": uri, "range": rng, "selectionRange": rng}
+
+    async def test_get_type_info_found(self):
+        import server, tempfile
+        with tempfile.NamedTemporaryFile(suffix=".cpp", delete=False, mode="w") as f:
+            for i in range(5):
+                f.write(f"// line {i}\n")
+            tmp = f.name
+
+        sym = self._symbol("myVar", file=tmp, line=2)
+        hover = {"contents": {"kind": "plaintext", "value": "int myVar"}}
+        mock_lsp = self._mock_lsp(workspace_symbol=[sym], hover=hover)
+        mock_lsp.open_file = AsyncMock()
+
+        with patch.object(server, "lsp", mock_lsp):
+            result = await server.get_type_info("myVar")
+
+        self.assertIn("myVar", result)
+        self.assertIn("int myVar", result)
+
+        import os; os.unlink(tmp)
+
+    async def test_get_type_info_no_symbol(self):
+        import server
+        with patch.object(server, "lsp", self._mock_lsp(workspace_symbol=[])):
+            result = await server.get_type_info("Ghost")
+        self.assertIn("No symbols found", result)
+
+    async def test_get_type_info_no_hover(self):
+        import server, tempfile
+        with tempfile.NamedTemporaryFile(suffix=".cpp", delete=False, mode="w") as f:
+            f.write("int x;\n")
+            tmp = f.name
+
+        sym = self._symbol("x", file=tmp, line=0)
+        mock_lsp = self._mock_lsp(workspace_symbol=[sym], hover=None)
+        mock_lsp.open_file = AsyncMock()
+
+        with patch.object(server, "lsp", mock_lsp):
+            result = await server.get_type_info("x")
+
+        self.assertIn("No type information", result)
+
+        import os; os.unlink(tmp)
+
+    async def test_find_implementations_found(self):
+        import server, tempfile
+        with tempfile.NamedTemporaryFile(suffix=".cpp", delete=False, mode="w") as f:
+            for i in range(10):
+                f.write(f"void impl_{i}() {{}}\n")
+            tmp = f.name
+
+        sym = self._symbol("draw", file=tmp, line=0)
+        impl_loc = {"uri": path_to_uri(tmp), "range": {"start": {"line": 3, "character": 5}, "end": {"line": 3, "character": 9}}}
+        mock_lsp = self._mock_lsp(workspace_symbol=[sym], implementation=[impl_loc])
+        mock_lsp.open_file = AsyncMock()
+
+        with patch.object(server, "lsp", mock_lsp):
+            result = await server.find_implementations("draw")
+
+        self.assertIn("implementation", result)
+        self.assertIn(tmp, result)
+
+        import os; os.unlink(tmp)
+
+    async def test_find_implementations_no_symbol(self):
+        import server
+        with patch.object(server, "lsp", self._mock_lsp(workspace_symbol=[])):
+            result = await server.find_implementations("IShape")
+        self.assertIn("No symbols found", result)
+
+    async def test_get_callers_found(self):
+        import server, tempfile
+        with tempfile.NamedTemporaryFile(suffix=".cpp", delete=False, mode="w") as f:
+            for i in range(15):
+                f.write(f"// line {i}\n")
+            tmp = f.name
+
+        sym = self._symbol("compute", file=tmp, line=0)
+        root_item = self._call_item("compute", file=tmp, line=0)
+        call = {
+            "from": self._call_item("main", file=tmp, line=5),
+            "fromRanges": [{"start": {"line": 7, "character": 4}, "end": {"line": 7, "character": 11}}],
+        }
+        mock_lsp = self._mock_lsp(
+            workspace_symbol=[sym],
+            prepare_call_hierarchy=[root_item],
+            incoming_calls=[call],
+        )
+        mock_lsp.open_file = AsyncMock()
+
+        with patch.object(server, "lsp", mock_lsp):
+            result = await server.get_callers("compute")
+
+        self.assertIn("caller", result)
+        self.assertIn("main", result)
+
+        import os; os.unlink(tmp)
+
+    async def test_get_callers_not_callable(self):
+        import server, tempfile
+        with tempfile.NamedTemporaryFile(suffix=".cpp", delete=False, mode="w") as f:
+            f.write("int x;\n")
+            tmp = f.name
+
+        sym = self._symbol("x", file=tmp, line=0)
+        mock_lsp = self._mock_lsp(workspace_symbol=[sym], prepare_call_hierarchy=[])
+        mock_lsp.open_file = AsyncMock()
+
+        with patch.object(server, "lsp", mock_lsp):
+            result = await server.get_callers("x")
+
+        self.assertIn("not callable", result)
+
+        import os; os.unlink(tmp)
+
+    async def test_get_callees_found(self):
+        import server, tempfile
+        with tempfile.NamedTemporaryFile(suffix=".cpp", delete=False, mode="w") as f:
+            for i in range(15):
+                f.write(f"// line {i}\n")
+            tmp = f.name
+
+        sym = self._symbol("main", file=tmp, line=0)
+        root_item = self._call_item("main", file=tmp, line=0)
+        call = {
+            "to": self._call_item("helper", file=tmp, line=8),
+            "fromRanges": [{"start": {"line": 3, "character": 4}, "end": {"line": 3, "character": 10}}],
+        }
+        mock_lsp = self._mock_lsp(
+            workspace_symbol=[sym],
+            prepare_call_hierarchy=[root_item],
+            outgoing_calls=[call],
+        )
+        mock_lsp.open_file = AsyncMock()
+
+        with patch.object(server, "lsp", mock_lsp):
+            result = await server.get_callees("main")
+
+        self.assertIn("callee", result)
+        self.assertIn("helper", result)
+
+        import os; os.unlink(tmp)
+
+    async def test_list_file_symbols(self):
+        import server, tempfile
+        with tempfile.NamedTemporaryFile(suffix=".cpp", delete=False, mode="w") as f:
+            f.write("int foo();\nclass Bar {};\n")
+            tmp = f.name
+
+        rng = {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 10}}
+        sym = {"name": "foo", "kind": 12, "range": rng, "selectionRange": rng}
+        mock_lsp = self._mock_lsp(document_symbol=[sym])
+        mock_lsp.open_file = AsyncMock()
+
+        with patch.object(server, "lsp", mock_lsp):
+            result = await server.list_file_symbols(tmp)
+
+        self.assertIn("foo", result)
+        self.assertIn("[Function]", result)
+
+        import os; os.unlink(tmp)
+
+    async def test_get_type_hierarchy_found(self):
+        import server, tempfile
+        with tempfile.NamedTemporaryFile(suffix=".h", delete=False, mode="w") as f:
+            f.write("struct Animal {};\nstruct Dog : Animal {};\n")
+            tmp = f.name
+
+        sym = self._symbol("Dog", kind=23, file=tmp, line=1)
+        root_item = self._call_item("Dog", file=tmp, line=1)
+        root_item["kind"] = 23
+        super_item = self._call_item("Animal", file=tmp, line=0)
+        super_item["kind"] = 23
+
+        mock_lsp = self._mock_lsp(
+            workspace_symbol=[sym],
+            prepare_type_hierarchy=[root_item],
+            type_supertypes=[super_item],
+            type_subtypes=[],
+        )
+        mock_lsp.open_file = AsyncMock()
+
+        with patch.object(server, "lsp", mock_lsp):
+            result = await server.get_type_hierarchy("Dog")
+
+        self.assertIn("Dog", result)
+        self.assertIn("Animal", result)
+        self.assertIn("Supertypes", result)
+        self.assertIn("Subtypes", result)
+
+        import os; os.unlink(tmp)
+
+    async def test_get_type_hierarchy_not_a_type(self):
+        import server, tempfile
+        with tempfile.NamedTemporaryFile(suffix=".cpp", delete=False, mode="w") as f:
+            f.write("void foo();\n")
+            tmp = f.name
+
+        sym = self._symbol("foo", file=tmp, line=0)
+        mock_lsp = self._mock_lsp(workspace_symbol=[sym], prepare_type_hierarchy=[])
+        mock_lsp.open_file = AsyncMock()
+
+        with patch.object(server, "lsp", mock_lsp):
+            result = await server.get_type_hierarchy("foo")
+
+        self.assertIn("not a type", result)
+
+        import os; os.unlink(tmp)
 
 
 # ---------------------------------------------------------------------------
