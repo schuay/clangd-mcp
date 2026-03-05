@@ -64,7 +64,7 @@ class LSPClient:
         workspace_uri = path_to_uri(workspace_dir)
         result = await self.request("initialize", {
             "processId": os.getpid(),
-            "clientInfo": {"name": "mcp-clangd", "version": "0.1.0"},
+            "clientInfo": {"name": "clangd-mcp", "version": "0.1.0"},
             "rootUri": workspace_uri,
             "workspaceFolders": [{"uri": workspace_uri, "name": "workspace"}],
             "capabilities": {

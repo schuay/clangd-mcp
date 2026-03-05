@@ -1,4 +1,4 @@
-# mcp-clangd
+# clangd-mcp
 
 > **Experimental** — expect rough edges and breaking changes.
 
@@ -30,27 +30,24 @@ to clangd. The two protocols are bridged by nine tools:
 ## Requirements
 
 - Python ≥ 3.12
-- [uv](https://docs.astral.sh/uv/) (or any other Python package manager)
+- [uv](https://docs.astral.sh/uv/)
 - [clangd](https://clangd.llvm.org/installation) on `$PATH` (or specify `--clangd`)
 - A `compile_commands.json` for your project (CMake: `cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON`)
 
 ## Installation
 
 ```bash
-git clone https://github.com/youruser/mcp-clangd
-cd mcp-clangd
-uv sync          # creates .venv and installs mcp
+uv tool install git+https://github.com/schuay/clangd-mcp.git
 ```
 
-## Running manually (for testing)
+This installs a `clangd-mcp` command into an isolated environment and puts a
+shim on your `$PATH`.  Upgrade later with:
 
 ```bash
-uv run python server.py \
-  --clangd /usr/bin/clangd \
-  --compile-commands-dir /path/to/build \
-  --workspace-dir /path/to/project \
-  --log-level INFO
+uv tool upgrade clangd-mcp
 ```
+
+## Options
 
 All flags are optional:
 
@@ -59,6 +56,7 @@ All flags are optional:
 | `--clangd` | `clangd` | Path to the clangd binary |
 | `--compile-commands-dir` | *(none)* | Directory containing `compile_commands.json` |
 | `--workspace-dir` | current directory | Root of the C/C++ project |
+| `--seed-file` | *(none)* | Source file to open at startup to trigger background indexing |
 | `--log-level` | `WARNING` | `DEBUG` / `INFO` / `WARNING` / `ERROR` (to stderr) |
 
 ## Configure with Claude Desktop
@@ -70,9 +68,8 @@ Add to `~/.config/Claude/claude_desktop_config.json` (Linux) or
 {
   "mcpServers": {
     "clangd": {
-      "command": "/absolute/path/to/mcp-clangd/.venv/bin/python",
+      "command": "clangd-mcp",
       "args": [
-        "/absolute/path/to/mcp-clangd/server.py",
         "--compile-commands-dir", "/path/to/your/build",
         "--workspace-dir", "/path/to/your/project"
       ]
@@ -83,25 +80,14 @@ Add to `~/.config/Claude/claude_desktop_config.json` (Linux) or
 
 ## Configure with Gemini CLI
 
-Gemini CLI supports MCP servers via
-[fastmcp](https://github.com/jlowin/fastmcp) as the runner.  Install fastmcp
-once:
-
-```bash
-uv tool install fastmcp
-```
-
-Then add to `~/.gemini/settings.json`:
+Add to `~/.gemini/settings.json`:
 
 ```json
 {
   "mcpServers": {
     "clangd": {
-      "command": "fastmcp",
+      "command": "clangd-mcp",
       "args": [
-        "run",
-        "/absolute/path/to/mcp-clangd/server.py",
-        "--",
         "--compile-commands-dir", "/path/to/your/build",
         "--workspace-dir", "/path/to/your/project"
       ]
@@ -109,16 +95,6 @@ Then add to `~/.gemini/settings.json`:
   }
 }
 ```
-
-`fastmcp run` takes care of activating the right virtualenv and passing
-arguments after `--` through to the server.
-
-> **Note:** if your project's `.venv` already has all dependencies, you can
-> also point directly at the venv Python:
-> ```json
-> "command": "/absolute/path/to/mcp-clangd/.venv/bin/python",
-> "args": ["server.py", "--compile-commands-dir", "..."]
-> ```
 
 ## Tests
 

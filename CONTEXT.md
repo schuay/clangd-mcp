@@ -1,4 +1,4 @@
-# Development Context for mcp-clangd
+# Development Context for clangd-mcp
 
 This document captures the full design rationale, protocol mechanics, and architectural decisions made during initial development. It is written so that a new AI agent (or human) can continue work without re-deriving any of it.
 

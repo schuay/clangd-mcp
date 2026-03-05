@@ -598,5 +598,9 @@ async def get_type_hierarchy(symbol_name: str) -> str:
 # Entry point
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
+def main():
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()

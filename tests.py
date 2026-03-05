@@ -1,4 +1,4 @@
-"""Tests for mcp-clangd.
+"""Tests for clangd-mcp.
 
 Runs without a real clangd binary by driving the LSP client with a fake
 in-process server that echoes back canned LSP responses.
