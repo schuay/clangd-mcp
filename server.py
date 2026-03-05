@@ -1,7 +1,7 @@
 """MCP server that exposes clangd capabilities as tools for Claude.
 
 Usage:
-    python main.py [--clangd PATH] [--compile-commands-dir DIR] [--workspace-dir DIR]
+    python server.py [--clangd PATH] [--compile-commands-dir DIR] [--workspace-dir DIR]
 
 The server speaks the Model Context Protocol (MCP) over stdio and bridges to
 clangd via the Language Server Protocol (LSP).

@@ -294,29 +294,29 @@ class TestMCPTools(unittest.IsolatedAsyncioTestCase):
         }
 
     async def test_find_symbol_found(self):
-        import main
+        import server
         sym = self._symbol("MyClass", kind=5)
-        with patch.object(main, "lsp", self._mock_lsp(workspace_symbol=[sym])):
-            result = await main.find_symbol("MyClass")
+        with patch.object(server, "lsp", self._mock_lsp(workspace_symbol=[sym])):
+            result = await server.find_symbol("MyClass")
         self.assertIn("MyClass", result)
         self.assertIn("[Class]", result)
         self.assertIn("foo.cpp", result)
 
     async def test_find_symbol_not_found(self):
-        import main
-        with patch.object(main, "lsp", self._mock_lsp(workspace_symbol=[])):
-            result = await main.find_symbol("Ghost")
+        import server
+        with patch.object(server, "lsp", self._mock_lsp(workspace_symbol=[])):
+            result = await server.find_symbol("Ghost")
         self.assertIn("No symbols found", result)
 
     async def test_find_symbol_caps_at_50(self):
-        import main
+        import server
         symbols = [self._symbol(f"sym_{i}") for i in range(60)]
-        with patch.object(main, "lsp", self._mock_lsp(workspace_symbol=symbols)):
-            result = await main.find_symbol("sym")
+        with patch.object(server, "lsp", self._mock_lsp(workspace_symbol=symbols)):
+            result = await server.find_symbol("sym")
         self.assertIn("10 more", result)
 
     async def test_get_definition_exact_match_preferred(self):
-        import main, tempfile, pathlib
+        import server, tempfile, pathlib
         # Write a temp file so _source_context can read it
         with tempfile.NamedTemporaryFile(suffix=".cpp", delete=False, mode="w") as f:
             for i in range(20):
@@ -335,8 +335,8 @@ class TestMCPTools(unittest.IsolatedAsyncioTestCase):
         )
         mock_lsp.open_file = AsyncMock()
 
-        with patch.object(main, "lsp", mock_lsp):
-            result = await main.get_definition("myFunc")
+        with patch.object(server, "lsp", mock_lsp):
+            result = await server.get_definition("myFunc")
 
         self.assertIn("myFunc", result)
         self.assertIn(tmp, result)
@@ -344,7 +344,7 @@ class TestMCPTools(unittest.IsolatedAsyncioTestCase):
         import os; os.unlink(tmp)
 
     async def test_find_references_groups_by_file(self):
-        import main, tempfile, pathlib
+        import server, tempfile, pathlib
         with tempfile.NamedTemporaryFile(suffix=".cpp", delete=False, mode="w") as f:
             for i in range(20):
                 f.write(f"use_it_here();  // line {i}\n")
@@ -360,8 +360,8 @@ class TestMCPTools(unittest.IsolatedAsyncioTestCase):
         mock_lsp = self._mock_lsp(workspace_symbol=[sym], references=refs)
         mock_lsp.open_file = AsyncMock()
 
-        with patch.object(main, "lsp", mock_lsp):
-            result = await main.find_references("use_it_here")
+        with patch.object(server, "lsp", mock_lsp):
+            result = await server.find_references("use_it_here")
 
         self.assertIn("2 reference", result)
         self.assertIn(tmp, result)
@@ -371,9 +371,9 @@ class TestMCPTools(unittest.IsolatedAsyncioTestCase):
         import os; os.unlink(tmp)
 
     async def test_find_references_not_found(self):
-        import main
-        with patch.object(main, "lsp", self._mock_lsp(workspace_symbol=[])):
-            result = await main.find_references("nobody")
+        import server
+        with patch.object(server, "lsp", self._mock_lsp(workspace_symbol=[])):
+            result = await server.find_references("nobody")
         self.assertIn("No symbols found", result)
 
 

@@ -7,10 +7,10 @@ intelligence.
 ## How it works
 
 ```
-Claude / Gemini  ←─ MCP (stdio) ─→  main.py  ←─ LSP (stdio) ─→  clangd
+Claude / Gemini  ←─ MCP (stdio) ─→  server.py  ←─ LSP (stdio) ─→  clangd
 ```
 
-`main.py` speaks MCP to the AI client and LSP (JSON-RPC 2.0 over stdin/stdout)
+`server.py` speaks MCP to the AI client and LSP (JSON-RPC 2.0 over stdin/stdout)
 to clangd. The two protocols are bridged by three tools:
 
 | Tool | LSP call | Description |
@@ -37,7 +37,7 @@ uv sync          # creates .venv and installs mcp
 ## Running manually (for testing)
 
 ```bash
-uv run python main.py \
+uv run python server.py \
   --clangd /usr/bin/clangd \
   --compile-commands-dir /path/to/build \
   --workspace-dir /path/to/project \
@@ -64,7 +64,7 @@ Add to `~/.config/Claude/claude_desktop_config.json` (Linux) or
     "clangd": {
       "command": "/absolute/path/to/mcp-clangd/.venv/bin/python",
       "args": [
-        "/absolute/path/to/mcp-clangd/main.py",
+        "/absolute/path/to/mcp-clangd/server.py",
         "--compile-commands-dir", "/path/to/your/build",
         "--workspace-dir", "/path/to/your/project"
       ]
@@ -92,7 +92,7 @@ Then add to `~/.gemini/settings.json`:
       "command": "fastmcp",
       "args": [
         "run",
-        "/absolute/path/to/mcp-clangd/main.py",
+        "/absolute/path/to/mcp-clangd/server.py",
         "--",
         "--compile-commands-dir", "/path/to/your/build",
         "--workspace-dir", "/path/to/your/project"
@@ -109,7 +109,7 @@ arguments after `--` through to the server.
 > also point directly at the venv Python:
 > ```json
 > "command": "/absolute/path/to/mcp-clangd/.venv/bin/python",
-> "args": ["main.py", "--compile-commands-dir", "..."]
+> "args": ["server.py", "--compile-commands-dir", "..."]
 > ```
 
 ## Tests
@@ -125,7 +125,7 @@ testing the MCP tool handlers.
 ## File structure
 
 ```
-main.py        MCP server: tools, arg parsing, clangd lifecycle
+server.py        MCP server: tools, arg parsing, clangd lifecycle
 lsp_client.py  LSP client: subprocess management, JSON-RPC framing, queries
 tests.py       Unit tests (no clangd required)
 pyproject.toml Dependencies (mcp>=1.0)

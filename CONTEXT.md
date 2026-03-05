@@ -11,7 +11,7 @@ It bridges two protocols:
 ```
 AI client (Claude / Gemini)
         ↕  MCP over stdio
-    main.py  (this server)
+    server.py  (this server)
         ↕  LSP over stdio
       clangd  (subprocess)
 ```
@@ -230,7 +230,7 @@ The reference uses `gopls`, `typescript-language-server`, and others; the same L
 
 1. Add a method to `LSPClient` in `lsp_client.py` that calls `self.request(method, params)` with the appropriate LSP method name and parameters. Return the raw result or `[]`/`{}` on null.
 
-2. Add an `@mcp.tool()` async function in `main.py`. Follow the pattern:
+2. Add an `@mcp.tool()` async function in `server.py`. Follow the pattern:
    - Assert `lsp is not None`.
    - Call `lsp.workspace_symbol(name)` to locate the symbol if the tool takes a symbol name.
    - Call `lsp.open_file(path)` before any position-based query.
@@ -263,7 +263,7 @@ Tests in `tests.py` use Python's `unittest.IsolatedAsyncioTestCase` which create
 2. **Message framing** — `TestMessageFraming` injects a real `asyncio.StreamReader` pre-loaded with hand-crafted LSP frames and drives `_read_message()` / `_send()` directly. The process object is a `MagicMock` with the stream attached to `proc.stdout`.
 3. **Request/response correlation** — `TestRequestResponse` replaces `_send` with a fake that immediately resolves the pending future, testing `request()`, `notify()`, and `_dispatch()` without network I/O.
 4. **LSP feature methods** — `TestLSPFeatureMethods` replaces `request` and `notify` on the client with coroutines returning canned responses, testing `workspace_symbol`, `definition`, `references`, `open_file`.
-5. **MCP tool handlers** — `TestMCPTools` uses `unittest.mock.patch.object(main, "lsp", mock_lsp)` to inject an `AsyncMock(spec=LSPClient)` as the global `lsp` in `main.py`, then calls the tool coroutines directly.
+5. **MCP tool handlers** — `TestMCPTools` uses `unittest.mock.patch.object(server, "lsp", mock_lsp)` to inject an `AsyncMock(spec=LSPClient)` as the global `lsp` in `server.py`, then calls the tool coroutines directly.
 
 The test for `open_file` creates a real temporary file because `open_file()` reads the file from disk to get its text content for the `didOpen` notification.
 
@@ -285,14 +285,14 @@ Everything else in the lockfile is transitive. The `mcp` package brings in `http
 
 ```bash
 # Development
-uv run python main.py --workspace-dir /path/to/project --log-level DEBUG
+uv run python server.py --workspace-dir /path/to/project --log-level DEBUG
 
 # Tests
 uv run python tests.py
 
 # MCP client config (Claude Desktop, Gemini CLI, etc.)
 # command: /path/to/.venv/bin/python
-# args: ["/path/to/main.py", "--compile-commands-dir", "/path/to/build"]
+# args: ["/path/to/server.py", "--compile-commands-dir", "/path/to/build"]
 ```
 
 clangd discovers `compile_commands.json` by searching upward from each source file. If the build directory is not a parent of the source tree, `--compile-commands-dir` is required. Without it, clangd falls back to a default compilation database with no include paths, which means it cannot resolve cross-file symbols correctly and `definition` / `references` will give poor results.
