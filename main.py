@@ -38,6 +38,8 @@ def _parse_args() -> argparse.Namespace:
                    help="Directory containing compile_commands.json")
     p.add_argument("--workspace-dir", metavar="DIR", default=os.getcwd(),
                    help="Root directory of the C/C++ project")
+    p.add_argument("--seed-file", metavar="FILE",
+                   help="Source file to open at startup to trigger clangd background indexing")
     p.add_argument("--log-level", default="WARNING",
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                    help="Logging verbosity (goes to stderr)")
@@ -65,13 +67,17 @@ async def lifespan(server: FastMCP):
     global lsp
 
     workspace_dir = os.path.abspath(args.workspace_dir)
-    clangd_cmd = [args.clangd, "--log=error"]
+    clangd_cmd = [args.clangd, "--log=error", "--background-index"]
     if args.compile_commands_dir:
         clangd_cmd.append(f"--compile-commands-dir={args.compile_commands_dir}")
 
     lsp = LSPClient()
     await lsp.start(clangd_cmd)
     await lsp.initialize(workspace_dir)
+
+    if args.seed_file:
+        await lsp.open_file(os.path.abspath(args.seed_file))
+        await lsp.wait_for_index()
 
     try:
         yield

@@ -41,6 +41,7 @@ class LSPClient:
         self._pending: dict[int, asyncio.Future[Any]] = {}
         self._next_id = 0
         self._open_files: set[str] = set()  # tracks URIs already opened
+        self._index_ready: asyncio.Event = asyncio.Event()
 
     # ------------------------------------------------------------------ #
     # Lifecycle                                                            #
@@ -93,6 +94,19 @@ class LSPClient:
                 await asyncio.wait_for(self._process.wait(), timeout=3.0)
             except Exception:
                 self._process.kill()
+
+    async def wait_for_index(self, timeout: float = 60.0) -> None:
+        """Wait until clangd signals background indexing is complete (or timeout).
+
+        Clangd sends $/progress end notifications when the background index
+        finishes.  If the index was already cached on disk, no progress is sent
+        and we proceed after the timeout with a debug message.
+        """
+        try:
+            await asyncio.wait_for(self._index_ready.wait(), timeout=timeout)
+            logger.info("clangd background index ready")
+        except asyncio.TimeoutError:
+            logger.debug("No $/progress end received within %.0fs; proceeding (index may be cached)", timeout)
 
     # ------------------------------------------------------------------ #
     # Transport                                                            #
@@ -147,7 +161,9 @@ class LSPClient:
                     future.set_exception(RuntimeError(f"LSP error: {msg['error']}"))
                 else:
                     future.set_result(msg.get("result"))
-        # Notifications and server-initiated requests are ignored for now.
+        elif msg.get("method") == "$/progress":
+            if msg.get("params", {}).get("value", {}).get("kind") == "end":
+                self._index_ready.set()
 
     async def _send(self, msg: dict[str, Any]) -> None:
         """Write one framed JSON-RPC message to clangd's stdin."""
@@ -160,10 +176,11 @@ class LSPClient:
 
     async def _log_stderr(self) -> None:
         assert self._process and self._process.stderr
-        while not self._process.stderr.at_eof():
-            line = await self._process.stderr.readline()
-            if line:
-                logger.debug("clangd: %s", line.decode(errors="replace").rstrip())
+        while True:
+            chunk = await self._process.stderr.read(4096)
+            if not chunk:
+                break
+            logger.debug("clangd: %s", chunk.decode(errors="replace").rstrip())
 
     # ------------------------------------------------------------------ #
     # JSON-RPC primitives                                                  #
