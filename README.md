@@ -47,18 +47,6 @@ shim on your `$PATH`.  Upgrade later with:
 uv tool upgrade clangd-mcp
 ```
 
-## Options
-
-All flags are optional:
-
-| Flag | Default | Description |
-|---|---|---|
-| `--clangd` | `clangd` | Path to the clangd binary |
-| `--compile-commands-dir` | *(none)* | Directory containing `compile_commands.json` |
-| `--workspace-dir` | current directory | Root of the C/C++ project |
-| `--seed-file` | *(none)* | Source file to open at startup to trigger background indexing |
-| `--log-level` | `WARNING` | `DEBUG` / `INFO` / `WARNING` / `ERROR` (to stderr) |
-
 ## Configure with Claude Desktop
 
 Add to `~/.config/Claude/claude_desktop_config.json` (Linux) or
@@ -81,7 +69,14 @@ Add to `~/.config/Claude/claude_desktop_config.json` (Linux) or
 
 ## Configure with Gemini CLI
 
-Add to `~/.gemini/settings.json`:
+```bash
+curl -fsSL https://raw.githubusercontent.com/schuay/clangd-mcp/main/install-gemini.sh | bash
+```
+
+This installs the tool, prompts for project paths, and adds the server to
+`~/.gemini/settings.json`. Requires `jq`.
+
+Or add manually to `~/.gemini/settings.json`:
 
 ```json
 {
@@ -97,6 +92,18 @@ Add to `~/.gemini/settings.json`:
   }
 }
 ```
+
+## Options
+
+All flags are optional:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--clangd` | `clangd` | Path to the clangd binary |
+| `--compile-commands-dir` | *(none)* | Directory containing `compile_commands.json` |
+| `--workspace-dir` | current directory | Root of the C/C++ project |
+| `--seed-file` | *(none)* | Source file to open at startup to trigger background indexing |
+| `--log-level` | `WARNING` | `DEBUG` / `INFO` / `WARNING` / `ERROR` (to stderr) |
 
 ## Tests
 
