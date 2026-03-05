@@ -71,7 +71,8 @@ Add to `~/.config/Claude/claude_desktop_config.json` (Linux) or
       "command": "clangd-mcp",
       "args": [
         "--compile-commands-dir", "/path/to/your/build",
-        "--workspace-dir", "/path/to/your/project"
+        "--workspace-dir", "/path/to/your/project",
+        "--seed-file", "/path/to/your/project/src/main.cpp"
       ]
     }
   }
@@ -89,7 +90,8 @@ Add to `~/.gemini/settings.json`:
       "command": "clangd-mcp",
       "args": [
         "--compile-commands-dir", "/path/to/your/build",
-        "--workspace-dir", "/path/to/your/project"
+        "--workspace-dir", "/path/to/your/project",
+        "--seed-file", "/path/to/your/project/src/main.cpp"
       ]
     }
   }
