@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 
 # Ensure jq is installed
 if ! command -v jq >/dev/null 2>&1; then
@@ -28,6 +29,8 @@ sf_dir=""
 mkdir -p "$(dirname "$SETTINGS_FILE")"
 [ -f "$SETTINGS_FILE" ] || echo '{}' > "$SETTINGS_FILE"
 cp "$SETTINGS_FILE" "$SETTINGS_FILE.bak"
+
+trap 'rm -f "$SETTINGS_FILE.tmp"' EXIT
 
 # Build the args array dynamically based on provided values
 ARGS="[]"
