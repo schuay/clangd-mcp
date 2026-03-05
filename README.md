@@ -1,5 +1,7 @@
 # mcp-clangd
 
+> **Experimental** — expect rough edges and breaking changes.
+
 A minimal [Model Context Protocol](https://modelcontextprotocol.io/) server that
 bridges AI assistants to [clangd](https://clangd.llvm.org/) for C/C++ code
 intelligence.
@@ -11,13 +13,19 @@ Claude / Gemini  ←─ MCP (stdio) ─→  server.py  ←─ LSP (stdio) ─→
 ```
 
 `server.py` speaks MCP to the AI client and LSP (JSON-RPC 2.0 over stdin/stdout)
-to clangd. The two protocols are bridged by three tools:
+to clangd. The two protocols are bridged by nine tools:
 
-| Tool | LSP call | Description |
+| Tool | LSP call(s) | Description |
 |---|---|---|
 | `find_symbol` | `workspace/symbol` | Search symbols by name (fuzzy) |
-| `get_definition` | `textDocument/definition` | Show the definition site with source |
-| `find_references` | `textDocument/references` | List every usage, grouped by file |
+| `get_definition` | `workspace/symbol` → `textDocument/definition` | Show the definition site with source |
+| `find_references` | `workspace/symbol` → `textDocument/references` | List every usage, grouped by file |
+| `get_type_info` | `workspace/symbol` → `textDocument/hover` | Show type signature and doc comment |
+| `find_implementations` | `workspace/symbol` → `textDocument/implementation` | Find concrete implementations of a virtual method or interface |
+| `get_callers` | `workspace/symbol` → `prepareCallHierarchy` → `incomingCalls` | Find every call site that calls a function |
+| `get_callees` | `workspace/symbol` → `prepareCallHierarchy` → `outgoingCalls` | Find every function called by a function |
+| `list_file_symbols` | `textDocument/documentSymbol` | List all symbols defined in a file |
+| `get_type_hierarchy` | `workspace/symbol` → `prepareTypeHierarchy` → `supertypes` + `subtypes` | Show base classes and derived classes |
 
 ## Requirements
 
@@ -115,7 +123,9 @@ arguments after `--` through to the server.
 ## Tests
 
 ```bash
-uv run python tests.py -v
+uv run python tests.py
+# or with pytest for coloured output:
+uv run pytest tests.py -v
 ```
 
 The test suite runs without a real clangd binary — it drives the LSP client
