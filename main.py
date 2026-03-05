@@ -13,6 +13,7 @@ Exposed tools:
 """
 
 import argparse
+import asyncio
 import logging
 import os
 import pathlib
@@ -77,7 +78,7 @@ async def lifespan(server: FastMCP):
 
     if args.seed_file:
         await lsp.open_file(os.path.abspath(args.seed_file))
-        await lsp.wait_for_index()
+        asyncio.create_task(lsp.wait_for_index(), name="lsp-indexer")
 
     try:
         yield
@@ -119,6 +120,16 @@ def _source_context(path: str, line_0: int, context: int = 4) -> str:
 # MCP tools
 # ---------------------------------------------------------------------------
 
+_INDEXING_MSG = (
+    "clangd is still indexing the project. Please retry in a moment."
+)
+
+
+def _indexing() -> bool:
+    """True if a seed file was provided but the index isn't ready yet."""
+    return args.seed_file is not None and lsp is not None and not lsp.index_ready
+
+
 @mcp.tool()
 async def find_symbol(query: str) -> str:
     """Search for C/C++ symbols (functions, classes, variables, …) by name.
@@ -127,6 +138,8 @@ async def find_symbol(query: str) -> str:
     Supports partial and fuzzy name matching.
     """
     assert lsp is not None
+    if _indexing():
+        return _INDEXING_MSG
     symbols = await lsp.workspace_symbol(query)
     if not symbols:
         return f"No symbols found matching '{query}'."
@@ -156,6 +169,8 @@ async def get_definition(symbol_name: str) -> str:
     snippet at the definition site.
     """
     assert lsp is not None
+    if _indexing():
+        return _INDEXING_MSG
     symbols = await lsp.workspace_symbol(symbol_name)
     if not symbols:
         return f"No symbols found matching '{symbol_name}'."
@@ -199,6 +214,8 @@ async def find_references(symbol_name: str) -> str:
     about (including the declaration).  Results are grouped by file.
     """
     assert lsp is not None
+    if _indexing():
+        return _INDEXING_MSG
     symbols = await lsp.workspace_symbol(symbol_name)
     if not symbols:
         return f"No symbols found matching '{symbol_name}'."
