@@ -47,27 +47,7 @@ shim on your `$PATH`.  Upgrade later with:
 uv tool upgrade clangd-mcp
 ```
 
-## Configure with Claude Desktop
-
-Add to `~/.config/Claude/claude_desktop_config.json` (Linux) or
-`~/Library/Application Support/Claude/claude_desktop_config.json` (macOS):
-
-```json
-{
-  "mcpServers": {
-    "clangd": {
-      "command": "clangd-mcp",
-      "args": [
-        "--compile-commands-dir", "/path/to/your/build",
-        "--workspace-dir", "/path/to/your/project",
-        "--seed-file", "/path/to/your/project/src/main.cpp"
-      ]
-    }
-  }
-}
-```
-
-## Configure with Gemini CLI
+### Gemini CLI
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/schuay/clangd-mcp/main/install-gemini.sh | bash
