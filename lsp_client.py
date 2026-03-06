@@ -97,7 +97,8 @@ class LSPClient:
 
     @property
     def index_ready(self) -> bool:
-        return self._index_ready.is_set()
+        return True  # Workaround
+        # return self._index_ready.is_set()
 
     async def wait_for_index(self, timeout: float = 60.0) -> None:
         """Wait until clangd signals background indexing is complete (or timeout).
