@@ -20,11 +20,11 @@ read -e -p "Seed file (source file to trigger background indexing): " raw_sf_dir
 
 # Resolve absolute paths and symlinks
 cc_dir=""
-[ -n "$raw_cc_dir" ] && cc_dir=$(realpath "$raw_cc_dir")
+[ -n "$raw_cc_dir" ] && cc_dir=$(realpath -e "${raw_cc_dir/#\~/$HOME}")
 ws_dir=""
-[ -n "$raw_ws_dir" ] && ws_dir=$(realpath "$raw_ws_dir")
+[ -n "$raw_ws_dir" ] && ws_dir=$(realpath -e "${raw_ws_dir/#\~/$HOME}")
 sf_dir=""
-[ -n "$raw_sf_dir" ] && sf_dir=$(realpath "$raw_sf_dir")
+[ -n "$raw_sf_dir" ] && sf_dir=$(realpath -e "${raw_sf_dir/#\~/$HOME}")
 
 mkdir -p "$(dirname "$SETTINGS_FILE")"
 [ -f "$SETTINGS_FILE" ] || echo '{}' > "$SETTINGS_FILE"
