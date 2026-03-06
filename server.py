@@ -1,21 +1,13 @@
-"""MCP server that exposes clangd capabilities as tools for Claude.
+"""MCP server that provides rich C/C++ language intelligence to LLMs via clangd.
 
-Usage:
-    python server.py [--clangd PATH] [--compile-commands-dir DIR] [--workspace-dir DIR]
+This server enables LLMs to deeply understand, navigate, and analyze C/C++ codebases by
+bridging the Model Context Protocol (MCP) to the Language Server Protocol (LSP).
 
-The server speaks the Model Context Protocol (MCP) over stdio and bridges to
-clangd via the Language Server Protocol (LSP).
+As a client, you are encouraged to use these tools aggressively to explore the
+codebase, resolve symbols, and understand complex relationships (inheritance, call
+graphs, etc.) before proposing changes.
 
-Exposed tools:
-    find_symbol        -- search workspace symbols by name
-    get_definition     -- find where a symbol is defined (with source preview)
-    find_references    -- find all usages of a symbol
-    get_type_info      -- show type/documentation info for a symbol (hover)
-    find_implementations -- find implementations of a virtual method or interface
-    get_callers        -- find all call sites that call a function
-    get_callees        -- find all functions called by a function
-    list_file_symbols  -- list all symbols defined in a file
-    get_type_hierarchy -- show supertypes and subtypes of a class/struct
+Note the server may be upgraded via: uv tool upgrade clangd-mcp
 """
 
 import argparse
@@ -194,10 +186,11 @@ def _indexing() -> bool:
 
 @mcp.tool()
 async def find_symbol(query: str) -> str:
-    """Search for C/C++ symbols (functions, classes, variables, …) by name.
+    """Search for C/C++ symbols (functions, classes, variables, enums, etc.) by name across the entire codebase.
 
+    Use this tool as your primary entry point when you know a symbol's name but don't know where it's defined or how it's used.
+    It supports partial and fuzzy matching, so you don't need the exact name.
     Returns matching symbols with their kind, container, and file location.
-    Supports partial and fuzzy name matching.
     """
     assert lsp is not None
     warning = _INDEXING_WARNING if _indexing() else ""
@@ -223,11 +216,12 @@ async def find_symbol(query: str) -> str:
 
 @mcp.tool()
 async def get_definition(symbol_name: str) -> str:
-    """Show the definition of a C/C++ symbol.
+    """Find and show the exact source code definition of a C/C++ symbol.
 
-    Looks up the symbol by name, then asks clangd for its definition location
-    (which may differ from the declaration in a header).  Returns the source
-    snippet at the definition site.
+    Use this tool when you want to read the actual implementation of a function, class, or variable.
+    It resolves the symbol by name and jumps directly to the definition (e.g., in a .cpp file),
+    even if you only have a reference to its declaration (e.g., in a .h file).
+    Returns a source snippet centered on the definition site.
     """
     assert lsp is not None
     warning = _INDEXING_WARNING if _indexing() else ""
@@ -268,10 +262,11 @@ async def get_definition(symbol_name: str) -> str:
 
 @mcp.tool()
 async def find_references(symbol_name: str) -> str:
-    """Find all usages of a C/C++ symbol across the codebase.
+    """Find all usages of a C/C++ symbol across the entire codebase.
 
-    Looks up the symbol by name, then collects every reference clangd knows
-    about (including the declaration).  Results are grouped by file.
+    Use this tool to understand the impact of changing a symbol, or to see real-world examples
+    of how a function or class is used in different contexts.
+    It returns a list of every reference clangd knows about, grouped by file.
     """
     assert lsp is not None
     warning = _INDEXING_WARNING if _indexing() else ""
@@ -320,10 +315,11 @@ async def find_references(symbol_name: str) -> str:
 
 @mcp.tool()
 async def get_type_info(symbol_name: str) -> str:
-    """Show type information and documentation for a C/C++ symbol.
+    """Show type information, signature, and documentation for a C/C++ symbol.
 
-    Looks up the symbol by name, then retrieves hover information from clangd,
-    which typically includes the type signature and any documentation comments.
+    Use this tool for a quick overview of a symbol (like a "hover" in an IDE).
+    It's perfect for checking function signatures, variable types, or reading
+    Doxygen-style documentation comments without opening the full source file.
     """
     assert lsp is not None
     warning = _INDEXING_WARNING if _indexing() else ""
@@ -353,10 +349,11 @@ async def get_type_info(symbol_name: str) -> str:
 
 @mcp.tool()
 async def find_implementations(symbol_name: str) -> str:
-    """Find implementations of a C/C++ virtual method or interface.
+    """Find all concrete implementations of a C/C++ virtual method or interface.
 
-    Looks up the symbol by name, then finds all concrete implementations
-    across the codebase. Useful for navigating polymorphic code.
+    Use this tool when you are working with polymorphic code or inheritance.
+    If you have a base class method, this tool will show you all the overridden versions
+    in derived classes.
     """
     assert lsp is not None
     warning = _INDEXING_WARNING if _indexing() else ""
@@ -404,10 +401,11 @@ async def find_implementations(symbol_name: str) -> str:
 
 @mcp.tool()
 async def get_callers(symbol_name: str) -> str:
-    """Find all call sites that call a given C/C++ function.
+    """Find all functions that call a given C/C++ function ("Who calls this?").
 
-    Looks up the function by name, builds a call hierarchy, then returns
-    every location in the codebase that calls this function.
+    Use this tool to trace the execution flow backwards. It's essential for
+    understanding how a function is integrated into the larger system and
+    identifying all possible entry points to it.
     """
     assert lsp is not None
     warning = _INDEXING_WARNING if _indexing() else ""
@@ -458,10 +456,10 @@ async def get_callers(symbol_name: str) -> str:
 
 @mcp.tool()
 async def get_callees(symbol_name: str) -> str:
-    """Find all functions called by a given C/C++ function.
+    """Find all functions called by a given C/C++ function ("What does this call?").
 
-    Looks up the function by name, builds a call hierarchy, then returns
-    every function that this function calls.
+    Use this tool to explore the dependencies and internal logic of a function.
+    It helps you see which other parts of the codebase this function relies on.
     """
     assert lsp is not None
     warning = _INDEXING_WARNING if _indexing() else ""
@@ -512,10 +510,11 @@ async def get_callees(symbol_name: str) -> str:
 
 @mcp.tool()
 async def list_file_symbols(file_path: str) -> str:
-    """List all symbols (functions, classes, variables, …) defined in a file.
+    """List all symbols (functions, classes, variables, etc.) defined in a specific file.
 
-    Provide an absolute or relative path to a C/C++ source or header file.
-    Returns a structured outline of all symbols with their kinds and locations.
+    Use this tool to get a high-level overview of a file's structure. It's like an
+    "Outline" view in an IDE, helping you quickly see what's inside a .cpp or .h file.
+    Expects an absolute or relative path to a C/C++ file.
     """
     assert lsp is not None
     warning = _INDEXING_WARNING if _indexing() else ""
@@ -534,10 +533,11 @@ async def list_file_symbols(file_path: str) -> str:
 
 @mcp.tool()
 async def get_type_hierarchy(symbol_name: str) -> str:
-    """Show the type hierarchy (supertypes and subtypes) of a C/C++ class or struct.
+    """Show the full type hierarchy (supertypes and subtypes) of a C/C++ class or struct.
 
-    Looks up the type by name, then retrieves both its base classes (supertypes)
-    and derived classes (subtypes) from clangd.
+    Use this tool when you want to understand the class inheritance structure.
+    It will show you both the base classes (parents) and any derived classes (children)
+    of the given type.
     """
     assert lsp is not None
     warning = _INDEXING_WARNING if _indexing() else ""
