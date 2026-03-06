@@ -41,6 +41,7 @@ class LSPClient:
         self._pending: dict[int, asyncio.Future[Any]] = {}
         self._next_id = 0
         self._open_files: set[str] = set()  # tracks URIs already opened
+        self._index_started: asyncio.Event = asyncio.Event()
         self._index_ready: asyncio.Event = asyncio.Event()
 
     # ------------------------------------------------------------------ #
@@ -103,15 +104,22 @@ class LSPClient:
     async def wait_for_index(self, timeout: float = 60.0) -> None:
         """Wait until clangd signals background indexing is complete (or timeout).
 
-        Clangd sends $/progress end notifications when the background index
-        finishes.  If the index was already cached on disk, no progress is sent
-        and we proceed after the timeout with a debug message.
+        Clangd sends $/progress begin/end notifications while indexing.  If the
+        index was already cached on disk, no progress is sent and we mark the
+        index ready immediately after a short probe window.
         """
+        try:
+            await asyncio.wait_for(self._index_started.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            logger.debug("No $/progress begin received; assuming index is cached")
+            self._index_ready.set()
+            return
         try:
             await asyncio.wait_for(self._index_ready.wait(), timeout=timeout)
             logger.info("clangd background index ready")
         except asyncio.TimeoutError:
-            logger.debug("No $/progress end received within %.0fs; proceeding (index may be cached)", timeout)
+            logger.debug("$/progress end not received within %.0fs; proceeding", timeout)
+            self._index_ready.set()
 
     # ------------------------------------------------------------------ #
     # Transport                                                            #
@@ -167,7 +175,10 @@ class LSPClient:
                 else:
                     future.set_result(msg.get("result"))
         elif msg.get("method") == "$/progress":
-            if msg.get("params", {}).get("value", {}).get("kind") == "end":
+            kind = msg.get("params", {}).get("value", {}).get("kind")
+            if kind == "begin":
+                self._index_started.set()
+            elif kind == "end":
                 self._index_ready.set()
 
     async def _send(self, msg: dict[str, Any]) -> None:
