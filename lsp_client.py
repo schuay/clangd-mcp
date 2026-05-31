@@ -11,6 +11,8 @@ import json
 import logging
 import os
 import pathlib
+import re
+import urllib.parse
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -26,13 +28,23 @@ SYMBOL_KINDS = {
 
 
 def path_to_uri(path: str) -> str:
-    return "file://" + os.path.abspath(path)
+    # pathlib.Path.as_uri() emits an RFC 8089 file URI on every platform:
+    #   POSIX   -> file:///home/user/foo.h
+    #   Windows -> file:///C:/Users/foo.h   (triple slash, forward slashes,
+    #              drive letter after the leading slash)
+    return pathlib.Path(os.path.abspath(path)).as_uri()
 
 
 def uri_to_path(uri: str) -> str:
-    if uri.startswith("file://"):
-        return uri[7:]
-    return uri
+    if not uri.startswith("file://"):
+        return uri
+    path = urllib.parse.unquote(urllib.parse.urlparse(uri).path)
+    # Windows file URIs arrive as "/C:/dir/file"; strip the spurious leading
+    # slash and normalise separators. POSIX paths are returned untouched so
+    # that "file:///tmp/foo.h" still maps to "/tmp/foo.h" on every platform.
+    if re.match(r"^/[A-Za-z]:/", path):
+        return os.path.normpath(path[1:])
+    return path
 
 
 class LSPClient:
