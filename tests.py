@@ -11,6 +11,7 @@ or:
 
 import asyncio
 import json
+import os
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -63,6 +64,14 @@ class TestUriHelpers(unittest.TestCase):
 
     def test_uri_to_path_passthrough(self):
         self.assertEqual(uri_to_path("/already/a/path"), "/already/a/path")
+
+    def test_path_to_uri_is_rfc8089(self):
+        # Regression: a file URI must use the empty-authority "file:///" form
+        # and never contain backslashes, otherwise clangd rejects it as an
+        # "unresolvable URI" on Windows.
+        uri = path_to_uri(os.path.abspath("foo.h"))
+        self.assertTrue(uri.startswith("file:///"))
+        self.assertNotIn("\\", uri)
 
 
 class TestMessageFraming(unittest.IsolatedAsyncioTestCase):
