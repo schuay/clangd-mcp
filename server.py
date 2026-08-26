@@ -1,3 +1,6 @@
+# Copyright 2026 The clangd-mcp developers
+# SPDX-License-Identifier: MIT
+
 """MCP server that provides rich C/C++ language intelligence to LLMs via clangd.
 
 This server enables LLMs to deeply understand, navigate, and analyze C/C++ codebases by

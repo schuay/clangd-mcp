@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright 2026 The clangd-mcp developers
+# SPDX-License-Identifier: MIT
+
 set -euo pipefail
 
 # Ensure jq is installed

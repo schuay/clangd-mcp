@@ -1,3 +1,6 @@
+# Copyright 2026 The clangd-mcp developers
+# SPDX-License-Identifier: MIT
+
 [project]
 name = "clangd-mcp"
 version = "0.1.0"

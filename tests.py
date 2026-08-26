@@ -1,3 +1,6 @@
+# Copyright 2026 The clangd-mcp developers
+# SPDX-License-Identifier: MIT
+
 """Tests for clangd-mcp.
 
 Runs without a real clangd binary by driving the LSP client with a fake

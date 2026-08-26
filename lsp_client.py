@@ -1,3 +1,6 @@
+# Copyright 2026 The clangd-mcp developers
+# SPDX-License-Identifier: MIT
+
 """Minimal LSP client that speaks to clangd over JSON-RPC 2.0 on stdin/stdout.
 
 Message framing follows the LSP specification:
