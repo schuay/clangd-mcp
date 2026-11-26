@@ -20,6 +20,19 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from lsp_client import LSPClient, path_to_uri, uri_to_path, SYMBOL_KINDS
 
+# server.py parses argv at import time; running `python tests.py [selector]`
+# must not leak unittest's selectors into that parser.
+def _import_server():
+    """Import server.py with benign argv (it parses argv at import time)."""
+    import sys
+    saved = sys.argv
+    sys.argv = saved[:1]
+    try:
+        import server
+    finally:
+        sys.argv = saved
+    return server
+
 
 # ---------------------------------------------------------------------------
 # Helpers for building fake LSP messages
@@ -345,6 +358,453 @@ class TestLSPFeatureMethods(unittest.IsolatedAsyncioTestCase):
 
 
 # ---------------------------------------------------------------------------
+# Unit tests: background-index readiness ($/progress state machine)
+# ---------------------------------------------------------------------------
+
+def _progress(kind: str, token: str = "backgroundIndexProgress", **value) -> dict:
+    return {"jsonrpc": "2.0", "method": "$/progress",
+            "params": {"token": token, "value": {"kind": kind, **value}}}
+
+
+class TestIndexReadiness(unittest.IsolatedAsyncioTestCase):
+
+    def test_initial_state_unknown(self):
+        client = LSPClient()
+        self.assertFalse(client.index_ready)
+        self.assertFalse(client.indexing)
+
+    async def test_dispatch_begin_report_end(self):
+        client = LSPClient()
+        client._dispatch(_progress("begin", title="Indexing"))
+        self.assertTrue(client.indexing)
+        self.assertFalse(client.index_ready)
+
+        client._dispatch(_progress("report", message="70%", percentage=70))
+        self.assertIsNotNone(client._index_last_report)
+        self.assertTrue(client.indexing)
+
+        client._dispatch(_progress("end", message="done", percentage=100))
+        self.assertTrue(client.index_ready)
+        self.assertFalse(client.indexing)
+
+    async def test_rearm_after_end(self):
+        # clangd sends repeated begin/report/end cycles as the queue drains:
+        # a later begin must make the client "indexing" again.
+        client = LSPClient()
+        client._dispatch(_progress("begin"))
+        client._dispatch(_progress("end"))
+        self.assertTrue(client.index_ready)
+        client._dispatch(_progress("begin"))
+        self.assertFalse(client.index_ready)
+        self.assertTrue(client.indexing)
+        client._dispatch(_progress("end"))
+        self.assertTrue(client.index_ready)
+
+    async def test_ignores_other_tokens(self):
+        client = LSPClient()
+        client._dispatch(_progress("begin", token="textDocument/parse"))
+        client._dispatch(_progress("end", token="textDocument/parse"))
+        self.assertFalse(client.indexing)
+        self.assertFalse(client.index_ready)
+        self.assertEqual(client._index_state, "unknown")
+
+    async def test_end_without_begin_marks_ready(self):
+        # clangd may report the end of a cycle whose begin predates us.
+        client = LSPClient()
+        client._dispatch(_progress("begin", token="parse"))  # unrelated token
+        self.assertEqual(client._index_state, "unknown")
+        client._dispatch(_progress("end"))
+        self.assertTrue(client.index_ready)
+
+    async def test_wait_for_index_end_within_timeout(self):
+        client = LSPClient()
+
+        async def produce():
+            await asyncio.sleep(0.05)
+            client._dispatch(_progress("begin"))
+            await asyncio.sleep(0.05)
+            client._dispatch(_progress("report", percentage=50))
+            await asyncio.sleep(0.05)
+            client._dispatch(_progress("end"))
+
+        task = asyncio.create_task(produce())
+        result = await client.wait_for_index(timeout=5.0, probe=0.1)
+        await task
+        self.assertTrue(result)
+        self.assertTrue(client.index_ready)
+
+    async def test_wait_for_index_no_begin_probe(self):
+        client = LSPClient()
+        result = await client.wait_for_index(timeout=5.0, probe=0.1)
+        self.assertTrue(result)
+        self.assertTrue(client.index_ready)
+        self.assertTrue(client.index_ready_assumed)
+        self.assertEqual(client._index_state, "ready")
+
+    async def test_wait_for_index_timeout_stays_indexing(self):
+        client = LSPClient()
+        client._dispatch(_progress("begin"))
+        result = await client.wait_for_index(timeout=0.1, probe=0.0)
+        self.assertFalse(result)
+        self.assertTrue(client.indexing)
+        self.assertFalse(client.index_ready)
+        self.assertFalse(client.index_ready_assumed)
+
+        # ...and a later end still flips it to ready for the next caller.
+        client._dispatch(_progress("end"))
+        self.assertTrue(client.index_ready)
+        self.assertTrue(await client.wait_for_index(timeout=0.1, probe=0.05))
+
+    async def test_initialize_advertises_work_done_progress(self):
+        client = LSPClient()
+        captured: dict = {}
+
+        async def fake_request(method, params=None):
+            captured["method"] = method
+            captured["params"] = params
+            return {"serverInfo": {"name": "clangd"}}
+
+        async def fake_notify(method, params=None):
+            pass
+
+        client.request = fake_request
+        client.notify = fake_notify
+        await client.initialize("/tmp/ws")
+
+        caps = captured["params"]["capabilities"]
+        self.assertEqual(caps["window"]["workDoneProgress"], True)
+        self.assertIn("symbol", caps["workspace"])
+        self.assertIn("definition", caps["textDocument"])
+        self.assertIn("references", caps["textDocument"])
+
+    async def test_replies_to_work_done_progress_create(self):
+        client = LSPClient()
+        sent: list[dict] = []
+
+        async def fake_send(msg):
+            sent.append(msg)
+
+        client._send = fake_send
+        client._dispatch({"jsonrpc": "2.0", "id": 42,
+                          "method": "window/workDoneProgress/create",
+                          "params": {"token": "backgroundIndexProgress"}})
+        await asyncio.sleep(0)  # let the reply task run
+        await asyncio.sleep(0)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0], {"jsonrpc": "2.0", "id": 42, "result": None})
+
+    async def test_dispatch_response_to_server_request_is_dropped(self):
+        # A response to a server-initiated request (has id, no method) must not
+        # crash or be treated as a notification.
+        client = LSPClient()
+        client._dispatch({"jsonrpc": "2.0", "id": 0, "result": None})
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: server-side indexing notices
+# ---------------------------------------------------------------------------
+
+class TestServerIndexingNotices(unittest.IsolatedAsyncioTestCase):
+
+    def _mock(self, indexing: bool, **results):
+        mock = AsyncMock(spec=LSPClient)
+        mock.indexing = indexing
+        mock.index_ready = not indexing
+        mock.wait_for_index.return_value = not indexing
+        for method, result in results.items():
+            getattr(mock, method).return_value = result
+        return mock
+
+    async def test_find_symbol_warns_while_indexing(self):
+        import server
+        with patch.object(server, "lsp", self._mock(True, workspace_symbol=[])):
+            result = await server.find_symbol("Ghost")
+        self.assertIn("still indexing", result)
+        self.assertNotIn("No symbols found", result)
+
+    async def test_find_symbol_no_warning_when_ready(self):
+        import server
+        sym = {"name": "Foo", "kind": 5, "containerName": "",
+               "location": {"uri": path_to_uri("/proj/foo.cpp"),
+                            "range": {"start": {"line": 0, "character": 0},
+                                      "end": {"line": 0, "character": 3}}}}
+        with patch.object(server, "lsp", self._mock(False, workspace_symbol=[sym])):
+            result = await server.find_symbol("Foo")
+        self.assertNotIn("still indexing", result)
+        self.assertIn("[Class] Foo", result)
+
+    async def test_find_symbol_still_warns_on_partial_results(self):
+        import server
+        sym = {"name": "Foo", "kind": 5, "containerName": "",
+               "location": {"uri": path_to_uri("/proj/foo.cpp"),
+                            "range": {"start": {"line": 0, "character": 0},
+                                      "end": {"line": 0, "character": 3}}}}
+        # Symbols came back but indexing is still running: results are partial.
+        with patch.object(server, "lsp", self._mock(True, workspace_symbol=[sym])):
+            result = await server.find_symbol("Foo")
+        self.assertIn("still indexing", result)
+        self.assertIn("Foo", result)
+
+    async def test_tools_wait_for_index_once(self):
+        import server
+        mock = self._mock(True, workspace_symbol=[])  # still indexing
+        # A never-finishing wait, so `_await_index` can't replace the task.
+        async def _hang(*a, **kw):
+            await asyncio.Event().wait()
+        mock.wait_for_index.side_effect = _hang
+        with patch.object(server, "lsp", mock), \
+                patch.object(server, "_index_task", None), \
+                patch.object(server.args, "index_wait_seconds", 0.01):
+            await server.find_symbol("x")
+            await server.find_symbol("y")
+        self.assertEqual(mock.wait_for_index.await_count, 1)
+
+    async def test_ready_index_costs_no_wait(self):
+        # Regression: a single-shot client (mcp-cli) calls one tool right after
+        # startup.  Once indexing has finished the call must not wait at all.
+        import server
+        mock = self._mock(False, workspace_symbol=[])
+        with patch.object(server, "lsp", mock), \
+                patch.object(server, "_index_task", None), \
+                patch.object(server.args, "index_wait_seconds", 30.0):
+            started = asyncio.get_running_loop().time()
+            await server.find_symbol("x")
+            elapsed = asyncio.get_running_loop().time() - started
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(mock.wait_for_index.await_count, 0)
+
+    async def test_get_type_info_warns_while_indexing(self):
+        import server
+        with patch.object(server, "lsp", self._mock(True, workspace_symbol=[])):
+            result = await server.get_type_info("Ghost")
+        self.assertIn("still indexing", result)
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: relay of server-initiated messages (clangd -> MCP client)
+# ---------------------------------------------------------------------------
+
+class _FakeStream:
+    """Async-iterable message stream fed from a queue (None ends it)."""
+
+    def __init__(self):
+        self.queue: asyncio.Queue = asyncio.Queue()
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        item = await self.queue.get()
+        if item is None:
+            raise StopAsyncIteration
+        return item
+
+
+class TestServerRequestRelay(unittest.IsolatedAsyncioTestCase):
+    """clangd's client-bound requests must not die as METHOD_NOT_FOUND."""
+
+    def setUp(self):
+        _import_server()  # benign argv, before anything else touches argv
+
+    def _client(self, sent: list):
+        client = LSPClient()
+
+        async def fake_send(msg):
+            sent.append(msg)
+
+        client._send = fake_send
+        return client
+
+    def _relay(self, client, items=()):
+        """Return (relay, inner stream, list of relayed requests)."""
+        import server
+        stream = _FakeStream()
+        for item in items:
+            stream.queue.put_nowait(item)
+        relay = server._RelayReadStream(stream, client)
+        relayed: list = []
+        original_put = relay._queue.put_nowait
+
+        def record_put(item):
+            relayed.append(item)
+            original_put(item)
+
+        relay._queue.put_nowait = record_put
+        return relay, stream, relayed
+
+    async def test_work_done_progress_create_answered_locally(self):
+        from mcp_types import JSONRPCRequest
+        from mcp.shared.message import SessionMessage
+
+        sent: list = []
+        relay, stream, relayed = self._relay(self._client(sent), [
+            SessionMessage(JSONRPCRequest(jsonrpc="2.0", id=0,
+                                          method="window/workDoneProgress/create",
+                                          params={"token": "backgroundIndexProgress"})),
+            None,
+        ])
+        passed = [item async for item in relay]
+        self.assertEqual(passed, [])
+        self.assertEqual(relayed, [])
+        self.assertEqual(sent, [{"jsonrpc": "2.0", "id": 0, "result": None}])
+
+    async def test_show_message_request_relayed_and_answered(self):
+        from mcp_types import JSONRPCRequest, JSONRPCResponse
+        from mcp.shared.message import SessionMessage
+
+        sent: list = []
+        client = self._client(sent)
+        relay, stream, relayed = self._relay(client, [
+            SessionMessage(JSONRPCRequest(
+                jsonrpc="2.0", id=1, method="window/showMessageRequest",
+                params={"type": 2, "message": "index too old",
+                        "actions": [{"title": "Dismiss"}, {"title": "Rebuild"}]})),
+        ])
+
+        async def drive():
+            # Answer the relayed elicitation, then close the stream.
+            while not relayed:
+                await asyncio.sleep(0.005)
+            elicit = relayed[0].message
+            stream.queue.put_nowait(SessionMessage(JSONRPCResponse(
+                jsonrpc="2.0", id=elicit.id,
+                result={"action": "accept", "content": {"action": "Rebuild"}})))
+            stream.queue.put_nowait(SessionMessage(JSONRPCRequest(
+                jsonrpc="2.0", id=2, method="tools/call", params={})))
+            stream.queue.put_nowait(None)
+
+        driver = asyncio.create_task(drive())
+        passed = [item async for item in relay]
+        await asyncio.wait_for(driver, timeout=2)
+
+        self.assertEqual([m.message.method for m in passed], ["elicitation/create", "tools/call"])
+        schema = passed[0].message.params["requestedSchema"]["properties"]["action"]
+        self.assertEqual(schema["enum"], ["Dismiss", "Rebuild"])
+        self.assertEqual(sent, [{"jsonrpc": "2.0", "id": 1,
+                                 "result": {"title": "Rebuild", "message": "index too old"}}])
+        self.assertEqual(len(relayed), 1)
+
+    async def test_rejected_elicit_answers_null(self):
+        from mcp_types import JSONRPCRequest, JSONRPCResponse
+        from mcp.shared.message import SessionMessage
+
+        sent: list = []
+        relay, stream, relayed = self._relay(self._client(sent), [
+            SessionMessage(JSONRPCRequest(
+                jsonrpc="2.0", id=3, method="window/showMessageRequest",
+                params={"type": 1, "message": "bad compile flags"})),
+        ])
+
+        async def drive():
+            while not relayed:
+                await asyncio.sleep(0.005)
+            stream.queue.put_nowait(SessionMessage(JSONRPCResponse(
+                jsonrpc="2.0", id=relayed[0].message.id, result={"action": "decline"})))
+            stream.queue.put_nowait(None)
+
+        driver = asyncio.create_task(drive())
+        [item async for item in relay]
+        await asyncio.wait_for(driver, timeout=2)
+        self.assertEqual(sent, [{"jsonrpc": "2.0", "id": 3, "result": None}])
+
+    async def test_unrelated_messages_pass_through(self):
+        from mcp_types import JSONRPCRequest
+        from mcp.shared.message import SessionMessage
+
+        sent: list = []
+        msg = SessionMessage(JSONRPCRequest(jsonrpc="2.0", id=5, method="tools/call", params={}))
+        relay, stream, _ = self._relay(self._client(sent), [msg, None])
+        self.assertEqual([item async for item in relay], [msg])
+        self.assertEqual(sent, [])
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: seed-file auto-pick
+# ---------------------------------------------------------------------------
+
+class TestSeedPicking(unittest.TestCase):
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+        os.makedirs(os.path.join(self.root, "src"), exist_ok=True)
+        os.makedirs(os.path.join(self.root, "build"), exist_ok=True)
+        self.src = os.path.join(self.root, "src", "main.cpp")
+        with open(self.src, "w") as f:
+            f.write("int main() { return 0; }\n")
+        self.header = os.path.join(self.root, "src", "main.h")
+        with open(self.header, "w") as f:
+            f.write("#pragma once\n")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _write_db(self, path: str, entries: list) -> None:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(entries, f)
+
+    def test_explicit_compile_commands_dir(self):
+        server = _import_server()
+        build_dir = os.path.join(self.root, "build")
+        self._write_db(os.path.join(build_dir, "compile_commands.json"), [
+            {"directory": self.root, "file": "/elsewhere/other.cpp"},
+            {"directory": os.path.join(self.root, "src"), "file": "main.cpp"},
+        ])
+        picked = server._seed_from_compile_commands(build_dir, self.root)
+        self.assertEqual(picked, self.src)
+
+    def test_compile_commands_in_workspace_root(self):
+        server = _import_server()
+        self._write_db(os.path.join(self.root, "compile_commands.json"),
+                       [{"directory": self.root, "file": "src/main.cpp"}])
+        self.assertEqual(server._seed_from_compile_commands(None, self.root), self.src)
+
+    def test_compile_commands_in_build_dir(self):
+        # CMake's default location when no --compile-commands-dir is given.
+        server = _import_server()
+        self._write_db(os.path.join(self.root, "build", "compile_commands.json"),
+                       [{"directory": os.path.join(self.root, "src"), "file": "main.cpp"}])
+        self.assertEqual(server._seed_from_compile_commands(None, self.root), self.src)
+
+    def test_compile_commands_skips_missing_and_outside(self):
+        server = _import_server()
+        self._write_db(os.path.join(self.root, "compile_commands.json"), [
+            {"directory": self.root, "file": "src/gone.cpp"},
+            {"directory": "/tmp", "file": "/tmp/outside.cpp"},
+            {"directory": self.root, "file": "src/main.cpp"},
+        ])
+        self.assertEqual(server._seed_from_compile_commands(None, self.root), self.src)
+
+    def test_compile_commands_missing_or_invalid(self):
+        server = _import_server()
+        self.assertIsNone(server._seed_from_compile_commands(None, self.root))
+        with open(os.path.join(self.root, "compile_commands.json"), "w") as f:
+            f.write("{not json")
+        self.assertIsNone(server._seed_from_compile_commands(None, self.root))
+
+    def test_no_filesystem_fallback(self):
+        # Without compile_commands.json there is no seed, even though a source
+        # file sits in the workspace.
+        server = _import_server()
+        with patch.object(server.args, "seed_file", None):
+            self.assertIsNone(server._pick_seed_file(self.root, None))
+
+    def test_explicit_seed_file_wins(self):
+        server = _import_server()
+        with patch.object(server.args, "seed_file", self.src):
+            self.assertEqual(server._pick_seed_file(self.root, None), self.src)
+
+    def test_pick_uses_compile_commands(self):
+        server = _import_server()
+        self._write_db(os.path.join(self.root, "compile_commands.json"),
+                       [{"directory": os.path.join(self.root, "src"), "file": "main.cpp"}])
+        with patch.object(server.args, "seed_file", None):
+            self.assertEqual(server._pick_seed_file(self.root, None), self.src)
+
+
+# ---------------------------------------------------------------------------
 # Integration-style tests: MCP tool handlers
 # ---------------------------------------------------------------------------
 
@@ -352,7 +812,13 @@ class TestMCPTools(unittest.IsolatedAsyncioTestCase):
     """Test tool handler logic by patching the global lsp object in main."""
 
     def _mock_lsp(self, **method_results):
+        # `indexing`/`index_ready` are plain properties on LSPClient, so they are
+        # absent from a spec'd AsyncMock and read as truthy mock attributes.
+        # Pin them so the tests see a finished index unless they say otherwise.
         mock = AsyncMock(spec=LSPClient)
+        mock.indexing = False
+        mock.index_ready = True
+        mock.wait_for_index.return_value = True
         for method, result in method_results.items():
             getattr(mock, method).return_value = result
         return mock

@@ -84,8 +84,15 @@ All flags are optional:
 | `--clangd` | `clangd` | Path to the clangd binary |
 | `--compile-commands-dir` | *(none)* | Directory containing `compile_commands.json` |
 | `--workspace-dir` | current directory | Root of the C/C++ project |
-| `--seed-file` | *(none)* | Source file to open at startup to trigger background indexing |
+| `--seed-file` | *(from compile_commands.json)* | Source file to open at startup (gives clangd a first indexing target). Optional: the server picks the first workspace source listed in `compile_commands.json` |
+| `--index-timeout-seconds` | `600` | Maximum time to wait for a started indexing pass to finish |
+| `--index-wait-seconds` | `10` | Maximum time a tool call blocks waiting for the index before answering with a "still indexing" notice |
 | `--log-level` | `WARNING` | `DEBUG` / `INFO` / `WARNING` / `ERROR` (to stderr) |
+
+The server starts immediately and never blocks on indexing. Index-dependent
+tools only wait while clangd is actually indexing (finishing within a second on
+a warm index), and while it is still indexing they say so instead of reporting
+"No symbols found".
 
 ## Tests
 

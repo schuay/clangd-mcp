@@ -15,10 +15,25 @@ import logging
 import os
 import pathlib
 import re
+import time
 import urllib.parse
-from typing import Any
+from typing import Any, Literal
 
 logger = logging.getLogger(__name__)
+
+# Token clangd uses for its background-index progress notifications.  Only
+# progress with this token is interpreted as indexing state; every other
+# work-done progress (e.g. per-file parsing) is ignored.
+INDEX_PROGRESS_TOKEN = "backgroundIndexProgress"
+
+# How long clangd may stay silent before its index is assumed usable: a cached
+# on-disk index is loaded without any $/progress, and a begin whose end never
+# arrives means the cycle was abandoned.  A prompt clangd always reports (or
+# finishes) well inside this window, so this is a constant of the protocol
+# rather than a tuning knob.
+INDEX_PROBE_SECONDS = 5.0
+
+IndexState = Literal["unknown", "indexing", "ready"]
 
 SYMBOL_KINDS = {
     1: "File", 2: "Module", 3: "Namespace", 4: "Package", 5: "Class",
@@ -56,8 +71,21 @@ class LSPClient:
         self._pending: dict[int, asyncio.Future[Any]] = {}
         self._next_id = 0
         self._open_files: set[str] = set()  # tracks URIs already opened
-        self._index_started: asyncio.Event = asyncio.Event()
-        self._index_ready: asyncio.Event = asyncio.Event()
+
+        # Background-index state machine (see wait_for_index):
+        #   unknown  -> nothing known yet
+        #   indexing -> a begin arrived, waiting for end
+        #   ready    -> the last seen indexing cycle finished
+        #
+        # `_index_rev` changes on every transition; waiters poll it instead of
+        # a set-once Event, so a later begin re-arms "indexing" and a later end
+        # re-marks "ready" even if a previous wait already finished.
+        self._index_state: IndexState = "unknown"
+        self._index_rev = 0
+        self._index_last_progress: float | None = None  # monotonic time of last $/progress
+        self._index_last_report: float | None = None    # monotonic time of last "report"
+        self._index_ready_assumed: bool = False
+        self._last_activity: float | None = None        # monotonic time of any LSP message
 
     # ------------------------------------------------------------------ #
     # Lifecycle                                                            #
@@ -91,6 +119,9 @@ class LSPClient:
                     "definition": {"linkSupport": False},
                     "references": {},
                 },
+                # clangd only reports background-index progress over $/progress
+                # if the client advertises workDoneProgress (LLVM D73218).
+                "window": {"workDoneProgress": True},
             },
         })
         server_info = result.get("serverInfo", {}) if result else {}
@@ -111,30 +142,124 @@ class LSPClient:
             except Exception:
                 self._process.kill()
 
+    # ------------------------------------------------------------------ #
+    # Background-index readiness                                           #
+    # ------------------------------------------------------------------ #
+
     @property
     def index_ready(self) -> bool:
-        return True  # Workaround
-        # return self._index_ready.is_set()
+        """True once the current indexing cycle finished (or was assumed cached)."""
+        return self._index_state == "ready"
 
-    async def wait_for_index(self, timeout: float = 60.0) -> None:
-        """Wait until clangd signals background indexing is complete (or timeout).
+    @property
+    def indexing(self) -> bool:
+        """True while clangd announced indexing that has not finished yet."""
+        return self._index_state == "indexing"
 
-        Clangd sends $/progress begin/end notifications while indexing.  If the
-        index was already cached on disk, no progress is sent and we mark the
-        index ready immediately after a short probe window.
+    @property
+    def index_ready_assumed(self) -> bool:
+        """True if readiness was inferred without seeing any progress cycle."""
+        return self._index_ready_assumed
+
+    def _set_index_state(self, state: IndexState, *, assumed: bool = False) -> None:
+        """Transition the index state machine and wake waiters."""
+        if state != self._index_state:
+            logger.debug("index state: %s -> %s", self._index_state, state)
+            self._index_state = state
+        self._index_ready_assumed = assumed
+        self._index_rev += 1
+
+    def _activity(self) -> float | None:
+        """Monotonic time of the last sign of life from clangd (LSP or progress)."""
+        candidates = [t for t in (self._last_activity, self._index_last_progress) if t is not None]
+        return max(candidates) if candidates else None
+
+    def _stalled(self, probe: float) -> bool:
+        """True if indexing is announced but clangd stopped doing anything.
+
+        A begin promises an end; it is only abandoned when no progress (and no
+        LSP traffic at all) has been seen for ``probe`` seconds, i.e. clangd is
+        not working on it any more.  A busy clangd keeps the cycle alive.
         """
-        try:
-            await asyncio.wait_for(self._index_started.wait(), timeout=5.0)
-        except asyncio.TimeoutError:
-            logger.debug("No $/progress begin received; assuming index is cached")
-            self._index_ready.set()
-            return
-        try:
-            await asyncio.wait_for(self._index_ready.wait(), timeout=timeout)
-            logger.info("clangd background index ready")
-        except asyncio.TimeoutError:
-            logger.debug("$/progress end not received within %.0fs; proceeding", timeout)
-            self._index_ready.set()
+        if self._index_state != "indexing" or probe <= 0:
+            return False
+        last = self._activity()
+        return last is not None and time.monotonic() - last >= probe
+
+    def _assume_ready(self, reason: str) -> None:
+        logger.info(
+            "Assuming clangd's index is usable (%s); tools may see partial "
+            "symbol data if indexing continues in the background", reason)
+        self._set_index_state("ready", assumed=True)
+
+    async def wait_for_index(
+        self, timeout: float = 600.0, probe: float = INDEX_PROBE_SECONDS,
+    ) -> bool:
+        """Wait until clangd's background index is usable (bounded).
+
+        clangd reports background indexing as repeated ``$/progress``
+        begin/report/end cycles with the token ``backgroundIndexProgress``.
+        Cycles repeat while the queue drains and refills, so ``end`` marks the
+        *current* cycle ready and a later ``begin`` re-arms indexing.
+
+        Waiting is transition-driven - it never sleeps out a fixed delay while
+        the index is already usable:
+
+          * ready already -> return immediately.  (A single-shot MCP client
+            calls one tool right after startup, by which time clangd has
+            usually finished its cycle: this must not cost a probe interval.)
+          * indexing -> wait until ``end``.  A ``begin`` is clangd's promise
+            that an ``end`` follows, so wait for it (up to ``timeout``) instead
+            of guessing from a fixed delay.  Only a begin whose clangd went
+            completely silent for ``probe`` seconds is written off as stalled.
+          * unknown -> wait for the first begin/report; if none arrives within
+            ``probe`` (``INDEX_PROBE_SECONDS``) the on-disk index was most
+            likely loaded from cache (clangd sends no progress for that), so
+            assume ready.
+
+        Returns True if the index is ready (or assumed ready), False if the
+        wait timed out while still indexing.
+        """
+        started = time.monotonic()
+        deadline = started + max(0.0, timeout)
+        while True:
+            if self._index_state == "ready":
+                return True
+
+            if self._index_state == "indexing":
+                # A begin was announced: wait for its end (that is the signal).
+                # If clangd goes completely silent mid-cycle for `probe`
+                # seconds, write the cycle off rather than block forever.
+                if self._stalled(probe):
+                    self._assume_ready(f"indexing progress stalled for {probe:.0f}s")
+                    return True
+                if time.monotonic() >= deadline:
+                    logger.warning(
+                        "clangd background index still running after %.0fs; "
+                        "returning partial results", timeout)
+                    return False
+            else:
+                # Nothing seen yet: cached index, or clangd is still starting
+                # up.  A cached index sends no progress at all, so the probe is
+                # the only upper bound on waiting.
+                if time.monotonic() - started >= probe:
+                    self._assume_ready(f"no indexing progress within {probe:.0f}s")
+                    return True
+                if time.monotonic() >= deadline:
+                    logger.warning(
+                        "no indexing progress after %.0fs; proceeding", timeout)
+                    return False
+
+            rev = self._index_rev
+            try:
+                await self._wait_rev_change(rev, deadline)
+            except asyncio.TimeoutError:
+                pass
+
+    async def _wait_rev_change(self, rev: int, deadline: float) -> None:
+        """Sleep until the index revision changes or the deadline passes."""
+        while self._index_rev == rev and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
 
     # ------------------------------------------------------------------ #
     # Transport                                                            #
@@ -181,6 +306,7 @@ class LSPClient:
 
     def _dispatch(self, msg: dict[str, Any]) -> None:
         """Route an incoming message to the waiting future (if any)."""
+        self._last_activity = time.monotonic()
         msg_id = msg.get("id")
         if msg_id is not None and msg_id in self._pending:
             future = self._pending.pop(msg_id)
@@ -190,11 +316,43 @@ class LSPClient:
                 else:
                     future.set_result(msg.get("result"))
         elif msg.get("method") == "$/progress":
-            kind = msg.get("params", {}).get("value", {}).get("kind")
-            if kind == "begin":
-                self._index_started.set()
-            elif kind == "end":
-                self._index_ready.set()
+            self._on_progress(msg.get("params") or {})
+        elif msg_id is not None and "method" in msg:
+            # Server-initiated request.  clangd sends
+            # window/workDoneProgress/create before its first progress
+            # notification and silently stops reporting if it gets no reply.
+            # The MCP transport answers unknown methods with an error; reply
+            # explicitly here so the client also works when driven directly.
+            if msg["method"] == "window/workDoneProgress/create":
+                asyncio.create_task(
+                    self._send({"jsonrpc": "2.0", "id": msg_id, "result": None}),
+                    name="lsp-workdone-reply",
+                )
+            else:
+                logger.debug("Ignoring server request %s", msg["method"])
+
+    def _on_progress(self, params: dict[str, Any]) -> None:
+        """Apply one $/progress notification to the index state machine."""
+        if params.get("token") != INDEX_PROGRESS_TOKEN:
+            return  # other progress stream (e.g. per-file parsing) - ignore
+        value = params.get("value") or {}
+        kind = value.get("kind")
+        now = time.monotonic()
+        # Any progress on the indexing token is a sign of life for _activity().
+        self._index_last_progress = now
+        if kind == "begin":
+            if self._index_state != "indexing":
+                logger.info("clangd started background indexing")
+            self._set_index_state("indexing")
+        elif kind == "report":
+            self._index_last_report = now
+            pct = value.get("percentage")
+            logger.debug("clangd indexing: %s%s", value.get("message", ""),
+                         f" ({pct}%)" if pct is not None else "")
+        elif kind == "end":
+            logger.info("clangd finished a background-indexing cycle")
+            self._index_last_report = now
+            self._set_index_state("ready")
 
     async def _send(self, msg: dict[str, Any]) -> None:
         """Write one framed JSON-RPC message to clangd's stdin."""

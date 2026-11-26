@@ -92,13 +92,13 @@ LSP requires an exact two-step handshake before any other requests:
    - `processId`: our PID (lets the server detect if client crashes)
    - `rootUri`: `file:///absolute/path/to/workspace` (tells clangd where to look)
    - `workspaceFolders`: same URI as a list (belt-and-suspenders; some servers prefer this)
-   - `capabilities`: what LSP features the client supports. We declare only what we actually use. Declaring `workspace.symbol.symbolKind.valueSet: [1..26]` tells clangd it can return all symbol kinds; without this it may filter results.
+   - `capabilities`: what LSP features the client supports. We declare only what we actually use. Declaring `workspace.symbol.symbolKind.valueSet: [1..26]` tells clangd it can return all symbol kinds; without this it may filter results. Declaring `window.workDoneProgress: true` is **required** for clangd to send background-index progress at all: without it clangd treats progress as `Unsupported` (LLVM D73218) and the index state machine stays in `unknown`.
 
 2. **Server responds** with its own capabilities and `serverInfo`.
 
 3. **Client sends `initialized` notification** (no params, empty `{}`). This is required — clangd won't respond to queries until it receives it.
 
-clangd starts background indexing after receiving `initialized`. Queries made before indexing completes will return partial results. The current code does not wait for indexing to finish, which is acceptable for interactive use — results improve as clangd indexes.
+clangd starts background indexing after receiving `initialized`. Index readiness is tracked by a small state machine in `LSPClient` (see "Indexing latency" below); tool calls take a short bounded wait for it instead of returning silently partial data.
 
 ### File lifecycle: why `textDocument/didOpen` is required
 
@@ -184,9 +184,14 @@ The fallback: if `textDocument/definition` returns nothing (e.g. the symbol is d
 
 **Symbol-name-based tool API.** The three tools all accept a symbol name string rather than a file path + line + column. This matches how an AI assistant naturally thinks about code ("show me the definition of `MyClass`" not "go to /path/foo.h line 42 col 8"). The position-based LSP API is used internally, resolved via `workspace/symbol` first.
 
-**No wait after `didOpen`.** Some LSP clients sleep 0.5–1s after opening a file to let the server parse it before querying. We skip this because: (a) it would add latency to every query, (b) clangd handles `textDocument/definition` synchronously from its AST even before diagnostics are ready, (c) it would make testing harder. If clangd returns empty results for definition on a freshly opened file, the fallback to the workspace/symbol location handles it gracefully.
+**No wait after `didOpen`.** Some LSP clients sleep 0.5–1s after opening a file to let the server parse it before querying. We skip this because: (a) it would add latency to every query, (b) clangd handles `textDocument/definition` synchronously from its AST even before diagnostics are ready, (c) it would make testing harder. If clangd returns empty results for definition on a freshly opened file, the fallback to the workspace/symbol location handles it gracefully. (Index-dependent *symbol search* is a different matter — for that we do wait, see "Indexing latency".)
 
-**Server-initiated messages silently ignored.** clangd sends `window/logMessage`, `textDocument/publishDiagnostics`, `$/progress` (indexing status) and others. Ignoring them is correct for read-only tools. If diagnostics or code actions are added, `_dispatch` needs to be extended with notification handler registration.
+**Startup never blocks on indexing.** `lifespan` starts clangd, opens a seed file if one can be found, and starts one background wait (`LSPClient.wait_for_index`) — it does not `await` indexing, so the MCP server answers immediately. Instead every index-dependent tool calls `_await_index()`, which returns at once when the index is already ready and otherwise shares that same background wait with a cap (`--index-wait-seconds`, default 10 s). The wait itself is transition-driven, never a fixed sleep: a call costs only as long as clangd actually needs (see "Indexing latency").
+
+**Server-initiated messages: progress tracked, requests answered.** clangd's `window/logMessage` and `textDocument/publishDiagnostics` notifications are still ignored (correct for read-only tools). Two kinds *are* handled:
+
+- `$/progress` notifications whose `token` is `backgroundIndexProgress` drive the index state machine in `LSPClient._dispatch` (`begin` → indexing, `report` → activity timestamp, `end` → ready). Progress with any other token (e.g. per-file parsing) is ignored.
+- clangd's server→client *requests* — `window/workDoneProgress/create` and `window/showMessageRequest` — must be answered, or clangd disables the feature for the whole session. `lsp_client._dispatch` replies `null` to the former directly. In the MCP process, `server._RelayReadStream` wraps the SDK's read stream (installed by `_install_relay` in `main`) so the MCP SDK never answers them with `METHOD_NOT_FOUND`: `workDoneProgress/create` is answered locally, and `showMessageRequest` is relayed to the MCP client as an `elicitation/create` whose answer is turned back into an LSP response.
 
 **`--log=error` passed to clangd.** Without this, clangd emits verbose progress messages to stderr. We suppress them to keep the MCP server's stderr (which goes to the AI client's log) clean. Set `--log-level DEBUG` on the MCP server and `--log=verbose` on clangd to see the full wire traffic during debugging.
 
@@ -214,7 +219,21 @@ The reference uses `gopls`, `typescript-language-server`, and others; the same L
 
 **`textDocument/definition` from a declaration may return the declaration itself.** If the function is defined in the header (inline, template, etc.), `definition` returns a location pointing back to the same place. This is correct behavior, not a bug. The tool displays it correctly.
 
-**Indexing latency.** clangd builds its index in the background after `initialized`. `workspace/symbol` on a large codebase will return partial results for the first several seconds. There is no way in the current protocol to wait for indexing to complete without polling `$/progress` notifications, which are currently ignored.
+**Indexing latency.** clangd builds its index in the background after `initialized`. `workspace/symbol` on a large codebase can legitimately return `[]` or partial results while the index is still loading/merging, so an empty answer must not be reported as "no such symbol".
+
+Readiness is a small state machine in `LSPClient` (`unknown` → `indexing` → `ready`):
+
+- A `begin` for token `backgroundIndexProgress` sets `indexing`; `end` sets `ready`. clangd may emit several begin→report→end cycles while the queue drains, so `end` marks the *current* cycle ready and the next `begin` re-arms `indexing` automatically.
+- `wait_for_index(timeout, probe)` waits on state transitions, not on a clock:
+  - already `ready` → returns immediately (callers short-circuit before this too);
+  - `indexing` → waits for the matching `end`, up to `timeout` (`--index-timeout-seconds`, default 600 s). A `begin` is clangd's promise of an `end`, so no quiet-window guess is used; only if clangd stops *all* activity for `probe` seconds is the cycle written off as stalled (returns ready, `index_ready_assumed`);
+  - `unknown` (nothing seen yet) → the on-disk index was most likely loaded from cache (clangd sends no progress for that) once `INDEX_PROBE_SECONDS` (5 s, a constant in `lsp_client`) has passed; the client marks itself ready and logs it at INFO. It is not an option: clangd always reports (or finishes) indexing within seconds on a working install, so tuning it would only hide a broken one.
+  - On `timeout` while `indexing` it returns `False`, leaves the state `indexing` (so tools warn) but keeps tracking.
+  - This replaced an earlier fixed probe that *always* slept: with a restart-on-every-call client (`mcp-cli`), clangd normally finishes its first cycle within a second of startup, so a fixed delay was pure added latency. The probe now only applies when clangd has said nothing at all.
+- Tools: after the bounded wait, if still `indexing` an empty symbol result becomes an explicit "clangd is still indexing… retry shortly" message instead of "No symbols found", and non-empty results are prefixed with `_INDEXING_WARNING`.
+- Caveat: if a large on-disk index loads silently and indexing only starts later (after the probe fired), the first calls may still see partial data without a warning. clangd exposes no "index fully loaded" signal, so the state machine is the best available approximation.
+
+**A seed file is opened automatically.** Opening one source file gives clangd work to do and makes progress reporting deterministic. `--seed-file` overrides the choice; otherwise the server picks the first existing workspace source listed in `compile_commands.json` (the database from `--compile-commands-dir`, or the one in the workspace root / its `build/` directory). That file is the tool's prerequisite anyway, so there is deliberately **no filesystem-walk fallback**: if no entry is usable the server logs a warning and relies on clangd indexing its on-disk database in the background.
 
 **`uri_to_path` is naive.** It strips the `file://` prefix by slicing at index 7. This is correct for absolute Unix paths (`file:///home/...` → `/home/...` since `///` → `/`). Windows paths (`file:///C:/...`) and URIs with percent-encoded characters would need `urllib.parse.unquote(urllib.request.url2pathname(...))`. This project targets Linux/macOS.
 

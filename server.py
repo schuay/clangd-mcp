@@ -15,11 +15,14 @@ Note the server may be upgraded via: uv tool upgrade clangd-mcp
 
 import argparse
 import asyncio
+import dataclasses
+import json
 import logging
 import os
 import pathlib
 import sys
 from contextlib import asynccontextmanager
+from typing import Literal
 
 from mcp.server.mcpserver import MCPServer
 
@@ -41,11 +44,18 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--workspace-dir", metavar="DIR", default=os.getcwd(),
                    help="Root directory of the C/C++ project")
     p.add_argument("--seed-file", metavar="FILE",
-                   help="Source file to open at startup to trigger clangd background indexing")
+                   help="Source file to open at startup to trigger clangd background indexing "
+                        "(optional; auto-detected from compile_commands.json)")
+    p.add_argument("--index-timeout-seconds", type=float, default=600.0, metavar="SEC",
+                   help="Maximum time to wait for a started indexing cycle to finish")
+    p.add_argument("--index-wait-seconds", type=float, default=10.0, metavar="SEC",
+                   help="Maximum time an index-dependent tool call blocks waiting for the "
+                        "index before answering with a 'still indexing' notice")
     p.add_argument("--log-level", default="WARNING",
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                    help="Logging verbosity (goes to stderr)")
     return p.parse_args()
+
 
 
 args = _parse_args()
@@ -60,13 +70,281 @@ logging.basicConfig(
 # LSP client — created during lifespan, used by tool handlers
 # ---------------------------------------------------------------------------
 
+logger = logging.getLogger("server")
+
 lsp: LSPClient | None = None
+
+
+# ---------------------------------------------------------------------------
+# Server-initiated request relay — clangd -> MCP client
+# ---------------------------------------------------------------------------
+#
+# clangd sends window/workDoneProgress/create and window/showMessageRequest as
+# *requests*, i.e. it expects a reply.  The MCP SDK answers any request method
+# it does not implement with a METHOD_NOT_FOUND error, and clangd treats that
+# as "no support" and silently disables the feature (this is why background
+# index progress never arrived before).  The read-stream proxy below forwards
+# those two methods to the MCP client, surfaces the client's answer as an LSP
+# response, and passes every other message through untouched.
+
+try:  # SDK plumbing; import-guarded in case of version drift
+    from mcp.shared.message import SessionMessage as _SessionMessage
+    from mcp_types import (
+        JSONRPCError as _JSONRPCError,
+        JSONRPCRequest as _JSONRPCRequest,
+        JSONRPCResponse as _JSONRPCResponse,
+    )
+    _HAS_RELAY = True
+except ImportError:  # pragma: no cover
+    _HAS_RELAY = False
+
+# clangd requests that a client is expected to answer.  (window/showMessage
+# and window/showDocument are notifications and need no relay.)
+_SERVER_REQUEST_METHODS = frozenset({"window/workDoneProgress/create", "window/showMessageRequest"})
+
+
+class _RelayReadStream:
+    """Read-stream proxy: relay clangd's client-bound requests over MCP.
+
+    A relayed request is rewritten into an MCP client request (elicit which
+    action to pick) and the client's answer is turned back into a plain LSP
+    response for clangd.  The SDK's own protocol sees only messages it can
+    handle, so no METHOD_NOT_FOUND is ever sent to clangd.
+    """
+
+    def __init__(self, inner, client: "LSPClient") -> None:
+        self._inner = inner
+        self._client = client
+        self._pending: dict[str, _JSONRPCRequest] = {}  # MCP id -> clangd request
+        self._queue: asyncio.Queue = asyncio.Queue()
+        self._inner_iter = None  # created lazily, reused across __anext__ calls
+
+    # async-iterator protocol
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        # Relayed requests are handed out before the next raw message; raw
+        # messages that are themselves relays are consumed here.
+        if not self._queue.empty():
+            return self._queue.get_nowait()
+        while True:
+            item = await self._next_raw()
+            if await self._handle(item):
+                if not self._queue.empty():
+                    return self._queue.get_nowait()
+                continue
+            return item
+
+    async def _next_raw(self):
+        """Pull one message from the wrapped stream (which stays open across awaits)."""
+        if self._inner_iter is None:
+            self._inner_iter = self._inner.__aiter__()
+        try:
+            return await self._inner_iter.__anext__()
+        except StopAsyncIteration:
+            raise StopAsyncIteration from None
+
+    # context-manager protocol (the SDK wraps the stream in `async with`)
+    async def __aenter__(self):
+        enter = getattr(self._inner, "__aenter__", None)
+        if enter is not None:
+            await enter()
+        return self
+
+    async def __aexit__(self, *exc):
+        exit_ = getattr(self._inner, "__aexit__", None)
+        return await exit_(*exc) if exit_ is not None else None
+
+    async def aclose(self) -> None:
+        close = getattr(self._inner, "aclose", None)
+        if close is not None:
+            await close()
+
+    async def _handle(self, item):
+        """Relay `item` if it is a client-bound clangd message; True if swallowed."""
+        msg = getattr(item, "message", None)
+        if isinstance(msg, _JSONRPCRequest) and msg.method in _SERVER_REQUEST_METHODS:
+            if msg.method == "window/workDoneProgress/create":
+                # Answer locally: the only thing clangd needs is a success reply.
+                await self._client._send({"jsonrpc": "2.0", "id": msg.id, "result": None})
+            else:
+                await self._relay_show_message_request(msg)
+            return True
+        if isinstance(msg, (_JSONRPCResponse, _JSONRPCError)):
+            clangd_req = self._pending.pop(str(msg.id), None)
+            if clangd_req is not None:
+                await self._client._send(_answered(clangd_req, msg))
+                return True
+        return False
+
+    async def _relay_show_message_request(self, msg: _JSONRPCRequest) -> None:
+        """Ask the MCP client which action to pick; its answer is relayed later."""
+        params = msg.params or {}
+        actions = params.get("actions") or []
+        schema: dict = {"type": "object", "properties": {}, "required": []}
+        if actions:
+            titles = [a.get("title", "") for a in actions]
+            schema = {"type": "object",
+                      "properties": {"action": {"type": "string", "enum": titles, "title": "Action"}},
+                      "required": ["action"]}
+        mcp_id = f"clangd-{msg.id}"
+        self._pending[mcp_id] = msg
+        self._queue.put_nowait(_SessionMessage(_JSONRPCRequest(
+            jsonrpc="2.0", id=mcp_id, method="elicitation/create",
+            params={"message": params.get("message", ""), "requestedSchema": schema},
+        )))
+
+
+def _answered(clangd_req: _JSONRPCRequest, answer) -> dict:
+    """Convert an MCP client answer into the LSP response for `clangd_req`."""
+    if isinstance(answer, _JSONRPCError):
+        return {"jsonrpc": "2.0", "id": clangd_req.id, "result": None}
+    result = answer.result or {}
+    content = result.get("content") if isinstance(result, dict) else None
+    title = content.get("action") if isinstance(content, dict) else None
+    if not title:
+        return {"jsonrpc": "2.0", "id": clangd_req.id, "result": None}
+    return {"jsonrpc": "2.0", "id": clangd_req.id,
+            "result": {"title": title,
+                       "message": (clangd_req.params or {}).get("message", "")}}
+
+
+def _install_relay(app: MCPServer, client: "LSPClient") -> None:
+    """Wrap the app's low-level runner so clangd->client requests are answered."""
+    if not _HAS_RELAY:  # pragma: no cover
+        logging.getLogger(__name__).warning(
+            "MCP SDK lacks the relay hooks; server-initiated messages are not relayed")
+        return
+    lowlevel = getattr(app, "_lowlevel_server", None)
+    run = getattr(lowlevel, "run", None)
+    if run is None:  # e.g. tests that replace the app with a mock
+        return
+
+    async def run_with_relay(read_stream, write_stream, initialization_options, *a, **kw):
+        return await run(_RelayReadStream(read_stream, client), write_stream,
+                         initialization_options, *a, **kw)
+
+    lowlevel.run = run_with_relay  # type: ignore[method-assign]
+
+
+# ---------------------------------------------------------------------------
+# Seed-file selection
+# ---------------------------------------------------------------------------
+#
+# Opening one source file makes clangd build an index of that translation unit
+# and guarantees the background indexer has work to do.  The file is taken from
+# compile_commands.json (which this tool requires anyway); `--seed-file`
+# overrides the automatic choice.
+
+_SOURCE_SUFFIXES = (".cpp", ".cc", ".cxx", ".c++", ".c")
+_COMPILE_COMMANDS_FILE = "compile_commands.json"
+
+
+def _is_within(path: str, root: str) -> bool:
+    try:
+        return os.path.commonpath([os.path.abspath(path), os.path.abspath(root)]) == os.path.abspath(root)
+    except ValueError:  # different drives
+        return False
+
+
+def _seed_from_compile_commands(compile_commands_dir: str | None, workspace_dir: str) -> str | None:
+    """First existing workspace source listed in compile_commands.json.
+
+    The database lives in `--compile-commands-dir` when given, otherwise in the
+    workspace root (or its `build/` directory, where CMake puts it by default).
+    """
+    candidates: list[str] = []
+    if compile_commands_dir:
+        candidates.append(os.path.join(compile_commands_dir, _COMPILE_COMMANDS_FILE))
+    else:
+        candidates.append(os.path.join(workspace_dir, _COMPILE_COMMANDS_FILE))
+        candidates.append(os.path.join(workspace_dir, "build", _COMPILE_COMMANDS_FILE))
+    for db_path in candidates:
+        try:
+            entries = json.loads(pathlib.Path(db_path).read_text(errors="replace"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            directory = entry.get("directory") or os.path.dirname(db_path)
+            file_ = entry.get("file")
+            if not file_:
+                continue
+            source = os.path.normpath(file_ if os.path.isabs(file_) else os.path.join(directory, file_))
+            if source.endswith(_SOURCE_SUFFIXES) and os.path.isfile(source) \
+                    and _is_within(source, workspace_dir):
+                return source
+    return None
+
+
+def _pick_seed_file(workspace_dir: str, compile_commands_dir: str | None) -> str | None:
+    """Choose the file to open at startup (an explicit --seed-file wins)."""
+    if args.seed_file:
+        seed = os.path.abspath(args.seed_file)
+        if not os.path.isfile(seed):
+            logger.warning("Seed file %s does not exist", seed)
+        return seed
+    seed = _seed_from_compile_commands(compile_commands_dir, workspace_dir)
+    if seed is None:
+        logger.warning(
+            "No usable entry in compile_commands.json; cannot pick a seed file. "
+            "clangd will still index the project in the background (set "
+            "--compile-commands-dir or --seed-file if this is unexpected)")
+    else:
+        logger.info("Auto-selected seed file: %s", seed)
+    return seed
+
+
+# ---------------------------------------------------------------------------
+# Startup / index readiness
+# ---------------------------------------------------------------------------
+
+_index_task: asyncio.Task[bool] | None = None  # the single background readiness wait
+
+
+def _ensure_index_waiter() -> asyncio.Task[bool]:
+    """Return the background readiness wait, starting it on first use."""
+    global _index_task
+    if _index_task is None or _index_task.done():
+        assert lsp is not None
+        _index_task = asyncio.create_task(
+            lsp.wait_for_index(timeout=args.index_timeout_seconds),
+            name="lsp-indexer",
+        )
+    return _index_task
+
+
+async def _await_index(timeout: float | None = None) -> None:
+    """Bounded wait for index readiness, shared with the background wait.
+
+    Tools call this before index-dependent queries so a cold start does not
+    silently return partial data.  It costs nothing once the index is ready
+    (the common case - clangd finishes its first cycle within a second of
+    startup) and is capped (default `--index-wait-seconds`) so a call never
+    blocks for a full cold build.
+    """
+    if lsp is None or lsp.index_ready:
+        return
+    task = _ensure_index_waiter()
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=timeout or args.index_wait_seconds)
+    except asyncio.TimeoutError:
+        pass
 
 
 @asynccontextmanager
 async def lifespan(server: MCPServer):
-    """Start clangd when the MCP server starts; shut it down on exit."""
-    global lsp
+    """Start clangd when the MCP server starts; shut it down on exit.
+
+    Startup never blocks on indexing: clangd is started and (if one can be
+    found) a seed file is opened, while readiness is tracked in the
+    background.  Index-dependent tool calls take a short bounded wait.
+    """
+    global lsp, _index_task
 
     workspace_dir = os.path.abspath(args.workspace_dir)
     clangd_cmd = [args.clangd, "--log=error", "--background-index"]
@@ -74,16 +352,23 @@ async def lifespan(server: MCPServer):
         clangd_cmd.append(f"--compile-commands-dir={args.compile_commands_dir}")
 
     lsp = LSPClient()
+    _install_relay(server, lsp)
     await lsp.start(clangd_cmd)
     await lsp.initialize(workspace_dir)
 
-    if args.seed_file:
-        await lsp.open_file(os.path.abspath(args.seed_file))
-        asyncio.create_task(lsp.wait_for_index(), name="lsp-indexer")
+    seed = _pick_seed_file(workspace_dir, args.compile_commands_dir)
+    if seed:
+        await lsp.open_file(seed)
+    # Track readiness even without a seed: with --background-index clangd
+    # indexes the database anyway and reports progress.
+    _ensure_index_waiter()
 
     try:
         yield
     finally:
+        if _index_task is not None:
+            _index_task.cancel()
+        _index_task = None
         await lsp.shutdown()
 
 
@@ -183,8 +468,22 @@ _INDEXING_WARNING = (
 
 
 def _indexing() -> bool:
-    """True if a seed file was provided but the index isn't ready yet."""
-    return args.seed_file is not None and lsp is not None and not lsp.index_ready
+    """True while clangd is (still) building its background index."""
+    return lsp is not None and getattr(lsp, "indexing", False)
+
+
+def _still_indexing(query: str) -> str:
+    """Message for an empty result returned while the index is not ready."""
+    return (
+        f"{_INDEXING_WARNING}"
+        f"clangd is still indexing the project, so '{query}' produced no results yet. "
+        "Retry shortly; results become complete once indexing finishes."
+    )
+
+
+def _indexing_notice() -> str:
+    """Short notice for successful results that may be incomplete."""
+    return _INDEXING_WARNING if _indexing() else ""
 
 
 @mcp.tool()
@@ -196,10 +495,14 @@ async def find_symbol(query: str) -> str:
     Returns matching symbols with their kind, container, and file location.
     """
     assert lsp is not None
-    warning = _INDEXING_WARNING if _indexing() else ""
+    await _await_index()
+    if _indexing():
+        # A cold index can legitimately answer [] rather than the truth, so
+        # don't let callers mistake this for "symbol does not exist".
+        return _still_indexing(query)
     symbols = await lsp.workspace_symbol(query)
     if not symbols:
-        return warning + f"No symbols found matching '{query}'."
+        return f"No symbols found matching '{query}'."
 
     lines = [f"Found {len(symbols)} symbol(s) matching '{query}':\n"]
     for sym in symbols[:50]:
@@ -214,7 +517,7 @@ async def find_symbol(query: str) -> str:
     if len(symbols) > 50:
         lines.append(f"\n  … and {len(symbols) - 50} more (refine your query)")
 
-    return warning + "\n".join(lines)
+    return _indexing_notice() + "\n".join(lines)
 
 
 @mcp.tool()
@@ -227,10 +530,14 @@ async def get_definition(symbol_name: str) -> str:
     Returns a source snippet centered on the definition site.
     """
     assert lsp is not None
-    warning = _INDEXING_WARNING if _indexing() else ""
+    await _await_index()
+    if _indexing():
+        # A cold index can legitimately answer [] rather than the truth, so
+        # don't let callers mistake this for "symbol does not exist".
+        return _still_indexing(symbol_name)
     symbols = await lsp.workspace_symbol(symbol_name)
     if not symbols:
-        return warning + f"No symbols found matching '{symbol_name}'."
+        return f"No symbols found matching '{symbol_name}'."
 
     # Prefer an exact name match; otherwise use the first result.
     exact = [s for s in symbols if s.get("name") == symbol_name]
@@ -255,12 +562,12 @@ async def get_definition(symbol_name: str) -> str:
         def_line = def_start.get("line", 0)
         loc_str = _format_location(def_loc)
         snippet = _source_context(def_path, def_line)
-        return warning + f"Definition of '{sym['name']}' at {loc_str}:\n\n{snippet}"
+        return _indexing_notice() + f"Definition of '{sym['name']}' at {loc_str}:\n\n{snippet}"
     else:
         # Fall back to the symbol's own declared location.
         loc_str = _format_location(decl_loc)
         snippet = _source_context(decl_path, decl_line)
-        return warning + f"'{sym['name']}' at {loc_str}:\n\n{snippet}"
+        return _indexing_notice() + f"'{sym['name']}' at {loc_str}:\n\n{snippet}"
 
 
 @mcp.tool()
@@ -272,10 +579,14 @@ async def find_references(symbol_name: str) -> str:
     It returns a list of every reference clangd knows about, grouped by file.
     """
     assert lsp is not None
-    warning = _INDEXING_WARNING if _indexing() else ""
+    await _await_index()
+    if _indexing():
+        # A cold index can legitimately answer [] rather than the truth, so
+        # don't let callers mistake this for "symbol does not exist".
+        return _still_indexing(symbol_name)
     symbols = await lsp.workspace_symbol(symbol_name)
     if not symbols:
-        return warning + f"No symbols found matching '{symbol_name}'."
+        return f"No symbols found matching '{symbol_name}'."
 
     exact = [s for s in symbols if s.get("name") == symbol_name]
     sym = exact[0] if exact else symbols[0]
@@ -290,7 +601,7 @@ async def find_references(symbol_name: str) -> str:
 
     refs = await lsp.references(decl_path, decl_line, decl_char)
     if not refs:
-        return warning + f"No references found for '{symbol_name}'."
+        return _indexing_notice() + f"No references found for '{symbol_name}'."
 
     # Group by file path, sorted by line within each file.
     by_file: dict[str, list[dict]] = {}
@@ -313,7 +624,7 @@ async def find_references(symbol_name: str) -> str:
             src = src_lines[line_0].strip() if line_0 < len(src_lines) else ""
             lines.append(f"  {line_0 + 1}:{col_0 + 1}  {src}")
 
-    return warning + "\n".join(lines)
+    return _indexing_notice() + "\n".join(lines)
 
 
 @mcp.tool()
@@ -325,10 +636,14 @@ async def get_type_info(symbol_name: str) -> str:
     Doxygen-style documentation comments without opening the full source file.
     """
     assert lsp is not None
-    warning = _INDEXING_WARNING if _indexing() else ""
+    await _await_index()
+    if _indexing():
+        # A cold index can legitimately answer [] rather than the truth, so
+        # don't let callers mistake this for "symbol does not exist".
+        return _still_indexing(symbol_name)
     symbols = await lsp.workspace_symbol(symbol_name)
     if not symbols:
-        return warning + f"No symbols found matching '{symbol_name}'."
+        return f"No symbols found matching '{symbol_name}'."
 
     exact = [s for s in symbols if s.get("name") == symbol_name]
     sym = exact[0] if exact else symbols[0]
@@ -343,11 +658,11 @@ async def get_type_info(symbol_name: str) -> str:
 
     hover = await lsp.hover(decl_path, decl_line, decl_char)
     if not hover:
-        return warning + f"No type information available for '{sym['name']}'."
+        return _indexing_notice() + f"No type information available for '{sym['name']}'."
 
     contents = _format_hover_contents(hover.get("contents", ""))
     loc_str = _format_location(decl_loc)
-    return warning + f"Type info for '{sym['name']}' at {loc_str}:\n\n{contents}"
+    return _indexing_notice() + f"Type info for '{sym['name']}' at {loc_str}:\n\n{contents}"
 
 
 @mcp.tool()
@@ -359,10 +674,14 @@ async def find_implementations(symbol_name: str) -> str:
     in derived classes.
     """
     assert lsp is not None
-    warning = _INDEXING_WARNING if _indexing() else ""
+    await _await_index()
+    if _indexing():
+        # A cold index can legitimately answer [] rather than the truth, so
+        # don't let callers mistake this for "symbol does not exist".
+        return _still_indexing(symbol_name)
     symbols = await lsp.workspace_symbol(symbol_name)
     if not symbols:
-        return warning + f"No symbols found matching '{symbol_name}'."
+        return f"No symbols found matching '{symbol_name}'."
 
     exact = [s for s in symbols if s.get("name") == symbol_name]
     sym = exact[0] if exact else symbols[0]
@@ -377,7 +696,7 @@ async def find_implementations(symbol_name: str) -> str:
 
     impls = await lsp.implementation(decl_path, decl_line, decl_char)
     if not impls:
-        return warning + f"No implementations found for '{sym['name']}'."
+        return _indexing_notice() + f"No implementations found for '{sym['name']}'."
 
     by_file: dict[str, list[dict]] = {}
     for impl in impls:
@@ -399,7 +718,7 @@ async def find_implementations(symbol_name: str) -> str:
             src = src_lines[line_0].strip() if line_0 < len(src_lines) else ""
             lines.append(f"  {line_0 + 1}:{col_0 + 1}  {src}")
 
-    return warning + "\n".join(lines)
+    return _indexing_notice() + "\n".join(lines)
 
 
 @mcp.tool()
@@ -411,10 +730,14 @@ async def get_callers(symbol_name: str) -> str:
     identifying all possible entry points to it.
     """
     assert lsp is not None
-    warning = _INDEXING_WARNING if _indexing() else ""
+    await _await_index()
+    if _indexing():
+        # A cold index can legitimately answer [] rather than the truth, so
+        # don't let callers mistake this for "symbol does not exist".
+        return _still_indexing(symbol_name)
     symbols = await lsp.workspace_symbol(symbol_name)
     if not symbols:
-        return warning + f"No symbols found matching '{symbol_name}'."
+        return f"No symbols found matching '{symbol_name}'."
 
     exact = [s for s in symbols if s.get("name") == symbol_name]
     sym = exact[0] if exact else symbols[0]
@@ -429,12 +752,12 @@ async def get_callers(symbol_name: str) -> str:
 
     items = await lsp.prepare_call_hierarchy(decl_path, decl_line, decl_char)
     if not items:
-        return warning + f"'{sym['name']}' is not callable or not found in the call hierarchy."
+        return _indexing_notice() + f"'{sym['name']}' is not callable or not found in the call hierarchy."
 
     root_item = items[0]
     calls = await lsp.incoming_calls(root_item)
     if not calls:
-        return warning + f"No callers found for '{sym['name']}'."
+        return _indexing_notice() + f"No callers found for '{sym['name']}'."
 
     lines = [f"Found {len(calls)} caller(s) of '{sym['name']}':\n"]
     for call in calls:
@@ -454,7 +777,7 @@ async def get_callers(symbol_name: str) -> str:
             src = src_lines[line_0].strip() if line_0 < len(src_lines) else ""
             lines.append(f"    called at {line_0 + 1}:{col_0 + 1}  {src}")
 
-    return warning + "\n".join(lines)
+    return _indexing_notice() + "\n".join(lines)
 
 
 @mcp.tool()
@@ -465,10 +788,14 @@ async def get_callees(symbol_name: str) -> str:
     It helps you see which other parts of the codebase this function relies on.
     """
     assert lsp is not None
-    warning = _INDEXING_WARNING if _indexing() else ""
+    await _await_index()
+    if _indexing():
+        # A cold index can legitimately answer [] rather than the truth, so
+        # don't let callers mistake this for "symbol does not exist".
+        return _still_indexing(symbol_name)
     symbols = await lsp.workspace_symbol(symbol_name)
     if not symbols:
-        return warning + f"No symbols found matching '{symbol_name}'."
+        return f"No symbols found matching '{symbol_name}'."
 
     exact = [s for s in symbols if s.get("name") == symbol_name]
     sym = exact[0] if exact else symbols[0]
@@ -483,12 +810,12 @@ async def get_callees(symbol_name: str) -> str:
 
     items = await lsp.prepare_call_hierarchy(decl_path, decl_line, decl_char)
     if not items:
-        return warning + f"'{sym['name']}' is not callable or not found in the call hierarchy."
+        return _indexing_notice() + f"'{sym['name']}' is not callable or not found in the call hierarchy."
 
     root_item = items[0]
     calls = await lsp.outgoing_calls(root_item)
     if not calls:
-        return warning + f"No callees found for '{sym['name']}'."
+        return _indexing_notice() + f"No callees found for '{sym['name']}'."
 
     try:
         src_lines = pathlib.Path(decl_path).read_text(errors="replace").splitlines()
@@ -508,7 +835,7 @@ async def get_callees(symbol_name: str) -> str:
             src = src_lines[line_0].strip() if line_0 < len(src_lines) else ""
             lines.append(f"    called at {line_0 + 1}:{col_0 + 1}  {src}")
 
-    return warning + "\n".join(lines)
+    return _indexing_notice() + "\n".join(lines)
 
 
 @mcp.tool()
@@ -520,18 +847,16 @@ async def list_file_symbols(file_path: str) -> str:
     Expects an absolute or relative path to a C/C++ file.
     """
     assert lsp is not None
-    warning = _INDEXING_WARNING if _indexing() else ""
-
     abs_path = os.path.abspath(file_path)
     await lsp.open_file(abs_path)
 
     symbols = await lsp.document_symbol(abs_path)
     if not symbols:
-        return warning + f"No symbols found in '{abs_path}'."
+        return f"No symbols found in '{abs_path}'."
 
     sym_lines = _format_doc_symbols(symbols)
     header = f"Symbols in '{abs_path}' ({len(sym_lines)} entries):\n"
-    return warning + header + "\n".join(sym_lines)
+    return _indexing_notice() + header + "\n".join(sym_lines)
 
 
 @mcp.tool()
@@ -543,10 +868,14 @@ async def get_type_hierarchy(symbol_name: str) -> str:
     of the given type.
     """
     assert lsp is not None
-    warning = _INDEXING_WARNING if _indexing() else ""
+    await _await_index()
+    if _indexing():
+        # A cold index can legitimately answer [] rather than the truth, so
+        # don't let callers mistake this for "symbol does not exist".
+        return _still_indexing(symbol_name)
     symbols = await lsp.workspace_symbol(symbol_name)
     if not symbols:
-        return warning + f"No symbols found matching '{symbol_name}'."
+        return f"No symbols found matching '{symbol_name}'."
 
     exact = [s for s in symbols if s.get("name") == symbol_name]
     sym = exact[0] if exact else symbols[0]
@@ -561,7 +890,7 @@ async def get_type_hierarchy(symbol_name: str) -> str:
 
     items = await lsp.prepare_type_hierarchy(decl_path, decl_line, decl_char)
     if not items:
-        return warning + f"'{sym['name']}' is not a type or not found in the type hierarchy."
+        return _indexing_notice() + f"'{sym['name']}' is not a type or not found in the type hierarchy."
 
     root_item = items[0]
     supertypes, subtypes = await asyncio.gather(
@@ -585,7 +914,7 @@ async def get_type_hierarchy(symbol_name: str) -> str:
     else:
         lines.append("  (none)")
 
-    return warning + "\n".join(lines)
+    return _indexing_notice() + "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -593,6 +922,10 @@ async def get_type_hierarchy(symbol_name: str) -> str:
 # ---------------------------------------------------------------------------
 
 def main():
+    # A real run reports indexing at INFO so a cold start is visible in the
+    # MCP client's log (the default level stays WARNING).
+    logging.getLogger("lsp_client").info(
+        "clangd-mcp starting (workspace=%s)", os.path.abspath(args.workspace_dir))
     mcp.run()
 
 
